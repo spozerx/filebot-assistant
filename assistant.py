@@ -229,24 +229,40 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
 
         # drop ids that do not exist, otherwise the whole call fails
         msgs = await client.get_messages(source, ids=chunk)
-        real = [m.id for m in msgs if m is not None and not m.action]
-        if not real:
+        usable = [m for m in msgs if m is not None and not m.action]
+        if not usable:
             continue
 
-        try:
-            fwd = await client.forward_messages(dest, real, source)
-        except FloodWaitError as e:
-            log.warning("flood wait %ss mid-range", e.seconds)
-            await asyncio.sleep(min(e.seconds, 300))
-            fwd = await client.forward_messages(dest, real, source)
+        # A clean copy (drop_author) is what we want in storage: no
+        # "Forwarded from" header leaking the source channel. The one thing a
+        # copy loses is the inline keyboard, so messages that carry buttons
+        # have to be forwarded properly, tag and all. Consecutive messages of
+        # the same kind are batched so ordering is preserved either way.
+        runs: list[tuple[bool, list[int]]] = []
+        for m in usable:
+            keep_tag = m.reply_markup is not None
+            if runs and runs[-1][0] == keep_tag:
+                runs[-1][1].append(m.id)
+            else:
+                runs.append((keep_tag, [m.id]))
 
-        # forward_messages returns None in the slots it could not deliver, so
-        # the list is not 1:1 with `real` and must be filtered before use
-        new_ids = [m.id for m in (fwd if isinstance(fwd, list) else [fwd]) if m is not None]
-        sent_total += len(new_ids)
+        for keep_tag, run_ids in runs:
+            try:
+                fwd = await client.forward_messages(
+                    dest, run_ids, source, drop_author=not keep_tag,
+                )
+            except FloodWaitError as e:
+                log.warning("flood wait %ss mid-range", e.seconds)
+                await asyncio.sleep(min(e.seconds, 300))
+                fwd = await client.forward_messages(
+                    dest, run_ids, source, drop_author=not keep_tag,
+                )
 
-        collected.extend(new_ids)
-        await asyncio.sleep(1)
+            # forward_messages returns None in the slots it could not deliver,
+            # so the list is not 1:1 with run_ids and must be filtered
+            new_ids = [m.id for m in (fwd if isinstance(fwd, list) else [fwd]) if m is not None]
+            sent_total += len(new_ids)
+            collected.extend(new_ids)
 
     # One publish at the end. The link already works off placeholder
     # references; wiping them before the real copies exist turned a mid-run
