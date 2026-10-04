@@ -223,9 +223,19 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     log.info("fetch_range %s %s..%s (%d messages)", chat, first, last, len(ids))
 
     sent_total = 0
-    collected: list[int] = []
-    for i in range(0, len(ids), 100):
-        chunk = ids[i:i + 100]
+    first_publish = True
+    # Ramped batch sizes. A flat 100 is best for raw throughput but it means
+    # the first file does not reach the user for several seconds; the reader
+    # is sitting there watching nothing. Starting small gets delivery moving
+    # almost immediately, then the batches grow to the efficient size.
+    def batches(seq: list[int]):
+        sizes, i = [10, 25, 50], 0
+        while i < len(seq):
+            n = sizes.pop(0) if sizes else 100
+            yield seq[i:i + n]
+            i += n
+
+    for chunk in batches(ids):
 
         # drop ids that do not exist, otherwise the whole call fails
         msgs = await client.get_messages(source, ids=chunk)
@@ -262,23 +272,38 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
             # so the list is not 1:1 with run_ids and must be filtered
             new_ids = [m.id for m in (fwd if isinstance(fwd, list) else [fwd]) if m is not None]
             sent_total += len(new_ids)
-            collected.extend(new_ids)
+            if not new_ids:
+                continue
 
-    # One publish at the end. The link already works off placeholder
-    # references; wiping them before the real copies exist turned a mid-run
-    # crash into a link with one file in it.
+            # Publish each run as soon as it lands. Holding everything until
+            # the end made the link unusable for the whole backfill; the user
+            # should be receiving file 1 while file 200 is still copying.
+            #
+            # `reset` clears the placeholder references, so it must fire on
+            # the first publish of THIS attempt and never again -- a retry
+            # starts from a clean slate instead of duplicating rows.
+            requests.post(
+                f"{WORKER_URL}/assistant/refs",
+                headers=HEADERS,
+                json={
+                    "bot_id": bot_id,
+                    "code": code,
+                    "chat_id": pool,
+                    "msg_ids": new_ids,
+                    "done": False,
+                    "reset": first_publish,
+                },
+                timeout=60,
+            )
+            first_publish = False
+
+    # Nothing left to add -- just mark it finished.
     requests.post(
         f"{WORKER_URL}/assistant/refs",
         headers=HEADERS,
-        json={
-            "bot_id": bot_id,
-            "code": code,
-            "chat_id": pool,
-            "msg_ids": collected,
-            "done": True,
-            "reset": bool(payload.get("reset")),
-        },
-        timeout=120,
+        json={"bot_id": bot_id, "code": code, "chat_id": pool,
+              "msg_ids": [], "done": True, "reset": first_publish},
+        timeout=60,
     )
 
     log.info("fetch_range done: %d messages", sent_total)
