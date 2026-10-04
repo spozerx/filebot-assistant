@@ -223,6 +223,7 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     log.info("fetch_range %s %s..%s (%d messages)", chat, first, last, len(ids))
 
     sent_total = 0
+    reset_pending = bool(payload.get("reset"))
     for i in range(0, len(ids), 100):
         chunk = ids[i:i + 100]
 
@@ -251,9 +252,12 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
                 "chat_id": pool,
                 "msg_ids": new_ids,
                 "done": i + 100 >= len(ids),
+                # only the first chunk clears the placeholder references
+                "reset": reset_pending,
             },
             timeout=30,
         )
+        reset_pending = False
         await asyncio.sleep(1)
 
     log.info("fetch_range done: %d messages", sent_total)
