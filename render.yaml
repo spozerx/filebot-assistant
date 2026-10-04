@@ -1,0 +1,16 @@
+services:
+  - type: web
+    name: filebot-assistant
+    runtime: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python assistant.py
+    envVars:
+      - key: TELETHON_API_ID
+        sync: false
+      - key: TELETHON_API_HASH
+        sync: false
+      - key: WORKER_URL
+        sync: false
+      - key: ASSISTANT_SHARED_SECRET
+        sync: false
