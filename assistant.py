@@ -55,7 +55,14 @@ SESSION: str | None = None
 CLIENT = None          # the signed-in Telethon client, shared by login + jobs
 LOOP = None            # the asyncio loop, so the HTTP thread can submit work
 
-POLL_IDLE = int(os.getenv("POLL_IDLE", "60"))      # seconds between empty polls
+POLL_IDLE = int(os.getenv("POLL_IDLE", "60"))      # fallback poll when nobody knocks
+
+# Polling alone is far too slow to feel instant: a job queued one second after
+# a poll waits a whole POLL_IDLE before anyone looks at it, and on Render's
+# free tier the dyno may be asleep entirely. So the Worker knocks on /wake the
+# moment it queues something -- that HTTP request both wakes the dyno and
+# releases this event, which is the difference between ~60s and ~2s.
+WAKE: "asyncio.Event | None" = None
 PROMOTE_GAP = int(os.getenv("PROMOTE_GAP", "45"))  # min seconds between promotions
 PORT = int(os.getenv("PORT", "10000"))
 
@@ -325,7 +332,12 @@ async def worker_loop() -> None:
     while True:
         job = pull_job()
         if not job:
-            await asyncio.sleep(POLL_IDLE)
+            # wait for a knock, but never trust it as the only trigger
+            try:
+                await asyncio.wait_for(WAKE.wait(), timeout=POLL_IDLE)
+            except asyncio.TimeoutError:
+                pass
+            WAKE.clear()
             continue
 
         jid, kind, payload = job["id"], job["kind"], job["payload"]
@@ -437,7 +449,15 @@ async def _login_password(lid: str, password: str) -> dict:
     return out
 
 
+async def _wake(_body: dict) -> dict:
+    """Release the poll loop right now. Used by the Worker when it queues a job."""
+    if WAKE is not None:
+        WAKE.set()
+    return {"ok": True, "signed_in": SESSION is not None}
+
+
 ROUTES = {
+    "/wake": _wake,
     "/login/start": lambda b: _login_start(b["phone"]),
     "/login/code": lambda b: _login_code(b["id"], b["code"]),
     "/login/password": lambda b: _login_password(b["id"], b["password"]),
@@ -490,8 +510,9 @@ def load_session() -> str | None:
 
 
 async def main() -> None:
-    global LOOP, SESSION
+    global LOOP, SESSION, WAKE
     LOOP = asyncio.get_running_loop()
+    WAKE = asyncio.Event()
     threading.Thread(target=serve_api, daemon=True).start()
     log.info("api listening on :%s", PORT)
 
