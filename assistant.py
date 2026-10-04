@@ -174,7 +174,24 @@ async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
         await client(ImportChatInviteRequest(hash_))
 
     # the join populates the session cache, so this now resolves
-    return await client.get_entity(pool)
+    entity = await client.get_entity(pool)
+
+    # Joining only makes us a member; a storage channel accepts posts from
+    # admins only. Ask the bot to promote us -- it can if it was given "add
+    # new admins", and if it was not the owner has to do it once by hand.
+    me = await client.get_me()
+    try:
+        pr = requests.post(f"{WORKER_URL}/assistant/promote", headers=HEADERS,
+                           json={"chat": pool, "user_id": me.id, "bot_id": bot_id},
+                           timeout=60).json()
+        if pr.get("ok"):
+            log.info("promoted to admin in %s", pool)
+        else:
+            log.warning("could not self-promote in %s: %s", pool, pr.get("error"))
+    except Exception as e:                          # noqa: BLE001
+        log.warning("promote call failed: %s", e)
+
+    return entity
 
 
 async def fetch_range(client: TelegramClient, payload: dict) -> None:
