@@ -33,6 +33,7 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import EditAdminRequest, InviteToChannelRequest
+from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import ChatAdminRights
 
 logging.basicConfig(
@@ -119,7 +120,7 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
         log.info("rate limit: sleeping %.0fs", wait)
         await asyncio.sleep(wait)
 
-    channel = await client.get_entity(int(pool))
+    channel = await resolve_pool(client, int(pool), int(payload.get("bot_id") or 0))
     bot = await client.get_entity(username)
 
     try:
@@ -138,6 +139,44 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
     _last_promote = time.time()
 
 
+async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
+    """
+    Get a usable entity for a storage channel.
+
+    Telethon can only address a channel this account has seen before. A fresh
+    session has seen nothing, so the very first job always failed with
+    "Could not find the input entity". Rather than make the owner add the
+    account by hand, ask the Worker for an invite link (the bot is already an
+    admin there) and join.
+    """
+    try:
+        return await client.get_entity(pool)
+    except (ValueError, TypeError):
+        pass
+
+    log.info("not a member of pool %s yet - requesting an invite", pool)
+    r = requests.post(f"{WORKER_URL}/assistant/invite", headers=HEADERS,
+                      json={"chat": pool, "bot_id": bot_id}, timeout=60)
+    data = r.json()
+    if not data.get("ok"):
+        raise RuntimeError(f"could not get an invite for {pool}: {data.get('error')}")
+
+    invite = data["invite"]
+    hash_ = invite.rstrip("/").split("/")[-1].lstrip("+")
+    try:
+        await client(ImportChatInviteRequest(hash_))
+        log.info("joined pool %s", pool)
+    except UserAlreadyParticipantError:
+        log.info("already in pool %s, just needed the entity", pool)
+    except FloodWaitError as e:
+        log.warning("flood wait %ss joining pool", e.seconds)
+        await asyncio.sleep(min(e.seconds, 300))
+        await client(ImportChatInviteRequest(hash_))
+
+    # the join populates the session cache, so this now resolves
+    return await client.get_entity(pool)
+
+
 async def fetch_range(client: TelegramClient, payload: dict) -> None:
     """
     Collect a message range from a channel the BOT cannot read.
@@ -154,7 +193,7 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     bot_id = int(payload["bot_id"])
 
     source = await client.get_entity(chat)
-    dest = await client.get_entity(pool)
+    dest = await resolve_pool(client, pool, bot_id)
 
     ids = list(range(first, last + 1))
     log.info("fetch_range %s %s..%s (%d messages)", chat, first, last, len(ids))
