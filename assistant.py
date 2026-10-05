@@ -17,6 +17,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -200,6 +201,62 @@ async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
     return entity
 
 
+QUALITY_RUNGS = (2160, 1440, 1080, 720, 480, 360, 240, 144)
+
+
+def _quality(height, name, caption):
+    """Same rules as the Worker: the name usually says it, height is a fallback."""
+    hay = f"{name or ''} {caption or ''}"
+    m = re.search(r"\b(\d{3,4})\s?[pP]\b", hay)
+    if m:
+        return f"{m.group(1)}p"
+    if re.search(r"\b(4k|2160|uhd)\b", hay, re.I):
+        return "2160p"
+    if re.search(r"\b(fhd|full\s?hd)\b", hay, re.I):
+        return "1080p"
+    if re.search(r"\bhd\b", hay, re.I):
+        return "720p"
+    if not height:
+        return None
+    for h in QUALITY_RUNGS:
+        if height >= h * 0.9:
+            return f"{h}p"
+    return f"{height}p"
+
+
+def file_meta(m):
+    """
+    What the Worker needs for {file_name} and friends.
+
+    Only this service ever sees these messages, so anything not collected
+    here is gone -- captions on assistant-built links rendered empty because
+    nothing was collected at all.
+    """
+    doc = getattr(m, "document", None)
+    name = size = caption = height = duration = None
+    caption = getattr(m, "message", None) or None
+
+    if doc is not None:
+        size = getattr(doc, "size", None)
+        for attr in getattr(doc, "attributes", []) or []:
+            if getattr(attr, "file_name", None):
+                name = attr.file_name
+            if getattr(attr, "h", None):
+                height = attr.h
+            if getattr(attr, "duration", None):
+                duration = int(attr.duration)
+    elif getattr(m, "photo", None) is not None:
+        name = "photo.jpg"
+
+    return {
+        "name": name,
+        "size": size,
+        "caption": caption,
+        "quality": _quality(height, name, caption),
+        "duration": duration,
+    }
+
+
 async def fetch_range(client: TelegramClient, payload: dict) -> None:
     """
     Collect a message range from a channel the BOT cannot read.
@@ -269,7 +326,9 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
 
             # forward_messages returns None in the slots it could not deliver,
             # so the list is not 1:1 with run_ids and must be filtered
-            new_ids = [m.id for m in (fwd if isinstance(fwd, list) else [fwd]) if m is not None]
+            got = [m for m in (fwd if isinstance(fwd, list) else [fwd]) if m is not None]
+            new_ids = [m.id for m in got]
+            new_meta = [file_meta(m) for m in got]
             sent_total += len(new_ids)
             if not new_ids:
                 continue
@@ -289,6 +348,7 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
                     "code": code,
                     "chat_id": pool,
                     "msg_ids": new_ids,
+                    "meta": new_meta,
                     "done": False,
                     "reset": first_publish,
                 },
