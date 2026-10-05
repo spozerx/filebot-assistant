@@ -32,7 +32,7 @@ from telethon.errors import (
     UserAlreadyParticipantError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import EditAdminRequest, InviteToChannelRequest
+from telethon.tl.functions.channels import EditAdminRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 from telethon.tl.types import ChatAdminRights
 
@@ -130,11 +130,10 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
     channel = await resolve_pool(client, int(pool), int(payload.get("bot_id") or 0))
     bot = await client.get_entity(username)
 
-    try:
-        await client(InviteToChannelRequest(channel=channel, users=[bot]))
-        log.info("added @%s to %s", username, pool)
-    except UserAlreadyParticipantError:
-        log.info("@%s already in %s", username, pool)
+    # No invite step. Telegram refuses to add a bot to a channel as a plain
+    # member -- "Bots can only be admins in channels" -- and EditAdmin below
+    # both adds and promotes it in one call. Inviting first simply failed
+    # every time and the clone never reached the storage channel.
 
     await client(EditAdminRequest(
         channel=channel,
