@@ -26,6 +26,7 @@ import requests
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
+    AdminsTooMuchError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
@@ -128,7 +129,8 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
         log.info("rate limit: sleeping %.0fs", wait)
         await asyncio.sleep(wait)
 
-    channel = await resolve_pool(client, int(pool), int(payload.get("bot_id") or 0))
+    bot_id = int(payload.get("bot_id") or 0)
+    channel = await resolve_pool(client, int(pool), bot_id)
     bot = await client.get_entity(username)
 
     # No invite step. Telegram refuses to add a bot to a channel as a plain
@@ -136,7 +138,27 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
     # both adds and promotes it in one call. Inviting first simply failed
     # every time and the clone never reached the storage channel.
 
-    await client(EditAdminRequest(
+    try:
+        await client(EditAdminRequest(
+        channel=channel,
+        user_id=bot,
+        admin_rights=BOT_RIGHTS,
+        rank="storage",
+    ))
+
+    except AdminsTooMuchError:
+        # 50 admins is a hard channel limit. Mark this pool full, take the
+        # next one, and promote there -- otherwise every clone created after
+        # the 50th would silently fail.
+        log.warning("pool %s is out of admin slots, switching", pool)
+        r = requests.post(f"{WORKER_URL}/assistant/nextpool", headers=HEADERS,
+                          json={"full": int(pool), "bot_id": bot_id},
+                          timeout=60).json()
+        if not r.get("ok"):
+            raise RuntimeError(r.get("error") or "no free storage channel")
+        pool = r["pool"]
+        channel = await resolve_pool(client, int(pool), bot_id)
+        await client(EditAdminRequest(
         channel=channel,
         user_id=bot,
         admin_rights=BOT_RIGHTS,
