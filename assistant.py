@@ -76,7 +76,7 @@ WAKE: "asyncio.Event | None" = None
 PROMOTE_GAP = int(os.getenv("PROMOTE_GAP", "45"))  # min seconds between promotions
 PORT = int(os.getenv("PORT", "10000"))
 
-HEADERS = {"Authorization": f"Bearer {SHARED_SECRET}", "X-Filebot-Protocol": "2"}
+HEADERS = {"Authorization": f"Bearer {SHARED_SECRET}", "X-Filebot-Protocol": "2", "X-Filebot-Storage-Protocol": "1"}
 
 # Rights a clone bot needs in the storage channel: post, edit and delete its
 # own stored messages. Nothing more — no member management, no invites.
@@ -384,7 +384,91 @@ def file_meta(m):
     }
 
 
+async def publish_storage_checkpoint(body):
+    # Retry publication, not Telegram forwarding: avoid re-copying accepted messages.
+    for attempt in range(3):
+        try:
+            return await worker_request("POST", "refs", body)
+        except WorkerAPIError as exc:
+            if exc.status < 500 or attempt == 2:
+                raise
+        except (requests.RequestException, TimeoutError):
+            if attempt == 2:
+                raise
+        await asyncio.sleep(0.25 * (2 ** attempt))
+
+
 async def fetch_range(client: TelegramClient, payload: dict) -> None:
+    if payload.get("storage_version") != 1:
+        return await fetch_range_legacy(client, payload)
+    first, last = int(payload["from"]), int(payload["to"])
+    cursor = int(payload.get("next_id", first))
+    pool, bot_id, code = int(payload["pool"]), int(payload["bot_id"]), payload["code"]
+    if first < 1 or last < first or last-first > 200000 or not first <= cursor <= last+1:
+        raise PermanentJobError("Invalid storage range or checkpoint")
+    source = await resolve_source(client, payload["chat"])
+    if getattr(source, "noforwards", False):
+        raise PermanentJobError("Telegram protects this source from forwarding")
+    # Pinned destination for the entire batch; no round-robin storage.
+    dest = await resolve_pool(client, pool, bot_id)
+    published = int(payload.get("published_count", 0))
+    sizes = [10, 25, 50] if published == 0 else []
+
+    async def publish(next_id, sources, copied, done=False):
+        nonlocal cursor, published
+        body = {"storage_version": 1, "bot_id": bot_id, "code": code, "chat_id": pool,
+                "expected_next_id": cursor, "next_id": next_id, "source_ids": sources,
+                "msg_ids": [m.id for m in copied], "meta": [file_meta(m) for m in copied],
+                "done": done, **job_fields()}
+        result = await publish_storage_checkpoint(body)
+        cursor = int(result["next_id"])
+        published = int(result["total"])
+
+    while cursor <= last:
+        size = sizes.pop(0) if sizes else 100
+        end = min(last, cursor + size - 1)
+        requested = list(range(cursor, end + 1))
+        messages = await client.get_messages(source, ids=requested)
+        usable = sorted((m for m in messages if m is not None and not getattr(m, "action", None)), key=lambda m: m.id)
+        if any(m.id not in requested for m in usable) or len({m.id for m in usable}) != len(usable):
+            raise PermanentJobError("Unexpected source message ordering")
+        if any(getattr(m, "noforwards", False) for m in usable):
+            raise PermanentJobError("Telegram protects a source message from forwarding")
+        if not usable:
+            await publish(end + 1, [], [])
+            continue
+        runs = []
+        for message in usable:
+            keep_tag = getattr(message, "reply_markup", None) is not None
+            if runs and runs[-1][0] == keep_tag:
+                runs[-1][1].append(message.id)
+            else:
+                runs.append((keep_tag, [message.id]))
+        for index, (keep_tag, ids) in enumerate(runs):
+            # Ordered MTProto batches keep normal storage throughput high; no artificial pause.
+            result = await client.forward_messages(dest, ids, source, drop_author=not keep_tag)
+            copied = result if isinstance(result, list) else [result]
+            complete = len(copied) == len(ids) and all(m is not None for m in copied)
+            if not complete:
+                # Never silently count a partial forward as complete. Commit only the known
+                # leading prefix, then stop for an explicit operator-visible failure.
+                prefix = []
+                for message in copied[:len(ids)]:
+                    if message is None:
+                        break
+                    prefix.append(message)
+                if prefix and len(copied) == len(ids):
+                    await publish(ids[len(prefix)-1]+1, ids[:len(prefix)], prefix)
+                raise PermanentJobError("Telegram returned an incomplete storage batch; remaining files were not marked stored")
+            if any(not isinstance(m.id, int) or m.id <= 0 or (i and m.id <= copied[i-1].id) for i, m in enumerate(copied)):
+                raise PermanentJobError("Unexpected destination message ordering")
+            next_id = end+1 if index == len(runs)-1 else ids[-1]+1
+            await publish(next_id, ids, copied)
+    await publish(last+1, [], [], done=True)
+    log.info("checkpointed storage complete: %d confirmed messages", published)
+
+
+async def fetch_range_legacy(client: TelegramClient, payload: dict) -> None:
     """
     Collect a message range from a channel the BOT cannot read.
 
@@ -761,7 +845,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "version": "workflow-import-2026-10-15"})
+                         "protocol": 2, "storage_protocol": 1, "version": "storage-first-2026-10-15"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):

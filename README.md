@@ -1,5 +1,11 @@
 # FileBot Assistant — setup
 
+**Current deployed-session policy:** keep the existing session stored by the Worker; do not generate a new session or change environment variables for this update. The legacy first-install notes below are not a redeployment instruction.
+
+**Storage-first update (2026-10-15):** protocol 2 plus `X-Filebot-Storage-Protocol: 1`. New public range jobs use one pinned destination, ordered 10/25/50/100 forwarding runs (or up to 100 immediately after a confirmed prefix), and atomic Worker publication checkpoints. No artificial storage delay. Resume at `next_id`, never reset a checkpointed range; retry publication without repeating forwarding. Partial/ambiguous results fail explicitly instead of being counted as complete. Protected sources remain rejected. Legacy jobs remain compatible; no old-link repair/requeue is performed.
+
+Deploy the matching storage-first Worker before this assistant. Preserve the free plan, single instance, original start command and environment/session. No schema migration. Tests: `.venv/bin/python -m unittest discover -s tests -v` (33 tests). Local tests mock Telegram; they do not establish real transfer latency. Telegram response/checkpoint loss can still leave untracked physical copies, so exactly-once external storage is not promised.
+
 This small service does the one thing the Cloudflare Worker cannot: **add a
 clone bot as an admin to the storage channel.** The Telegram Bot API has no
 method for a bot to add another bot to a channel, so a real user account has to
