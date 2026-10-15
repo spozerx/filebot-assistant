@@ -14,18 +14,25 @@ and rate-limits itself so Telegram never flags the account.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import hmac
+import hashlib
+import socket
 import json
 import logging
 import os
 import re
 import threading
 import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError,
+    ChatForwardsRestrictedError,
+    ChannelPrivateError,
+    ChatAdminRequiredError,
     AdminsTooMuchError,
     PasswordHashInvalidError,
     PhoneCodeExpiredError,
@@ -68,7 +75,7 @@ WAKE: "asyncio.Event | None" = None
 PROMOTE_GAP = int(os.getenv("PROMOTE_GAP", "45"))  # min seconds between promotions
 PORT = int(os.getenv("PORT", "10000"))
 
-HEADERS = {"Authorization": f"Bearer {SHARED_SECRET}"}
+HEADERS = {"Authorization": f"Bearer {SHARED_SECRET}", "X-Filebot-Protocol": "2"}
 
 # Rights a clone bot needs in the storage channel: post, edit and delete its
 # own stored messages. Nothing more — no member management, no invites.
@@ -89,28 +96,126 @@ _last_promote = 0.0
 
 
 # ---------------------------------------------------------------- worker API
-def pull_job() -> dict | None:
+async def pull_job() -> dict | None:
     try:
-        r = requests.get(f"{WORKER_URL}/assistant/pull", headers=HEADERS, timeout=20)
-        if r.status_code != 200:
-            log.warning("pull failed: HTTP %s", r.status_code)
-            return None
-        return r.json().get("job")
-    except Exception as e:
-        log.warning("pull error: %s", e)
+        return (await worker_request("GET", "pull")).get("job")
+    except Exception:
+        log.warning("job poll unavailable")
         return None
 
 
-def ack(job_id: int, ok: bool, error: str | None = None) -> None:
+async def ack(job_id: int, ok: bool, error: str | None = None) -> None:
+    job = ACTIVE_JOB
+    if not job or job["id"] != job_id:
+        raise RuntimeError("No matching active job")
+    await send_ack(job, ok, error)
+
+
+class WorkerAPIError(RuntimeError):
+    def __init__(self, status=0):
+        self.status = status
+        super().__init__(f"Worker API request failed (HTTP {status})")
+
+
+class PermanentJobError(RuntimeError):
+    pass
+
+
+ACTIVE_JOB = None
+SESSION_SWITCHING = False
+OPERATIONS = {}
+
+
+def worker_request_sync(method, path, payload=None, timeout=20):
+    # Do not expose response bodies, auth headers, Mongo URIs or login inputs in errors.
+    r = requests.request(method, f"{WORKER_URL}/assistant/{path}", headers=HEADERS,
+                         json=payload, timeout=timeout)
+    if not 200 <= r.status_code < 300:
+        raise WorkerAPIError(r.status_code)
     try:
-        requests.post(
-            f"{WORKER_URL}/assistant/ack",
-            headers=HEADERS,
-            json={"job_id": job_id, "ok": ok, "error": error},
-            timeout=20,
-        )
-    except Exception as e:
-        log.warning("ack error: %s", e)
+        data = r.json()
+    except ValueError:
+        raise WorkerAPIError(r.status_code) from None
+    if not isinstance(data, dict) or data.get("ok") is False:
+        raise WorkerAPIError(r.status_code)
+    return data
+
+
+async def worker_request(method, path, payload=None, timeout=20):
+    return await asyncio.to_thread(worker_request_sync, method, path, payload, timeout)
+
+
+def job_fields():
+    job = ACTIVE_JOB or {}
+    return {"job_id": job.get("id"), "lease_token": job.get("lease_token")}
+
+
+async def send_ack(job, ok, error=None, **extra):
+    payload = {"job_id": job["id"], "lease_token": job.get("lease_token"),
+               "ok": ok, "error": error, **extra}
+    for attempt in range(3):
+        try:
+            return await worker_request("POST", "ack", payload)
+        except WorkerAPIError as exc:
+            if exc.status == 409 or (400 <= exc.status < 500 and exc.status != 429):
+                raise
+        except requests.RequestException:
+            pass
+        if attempt < 2:
+            await asyncio.sleep(2 ** attempt)
+    raise WorkerAPIError()
+
+
+async def lease_heartbeat(job):
+    last_ok = time.monotonic()
+    while True:
+        await asyncio.sleep(25)
+        try:
+            await worker_request("POST", "heartbeat",
+                                 {"job_id": job["id"], "lease_token": job["lease_token"]}, timeout=10)
+            last_ok = time.monotonic()
+        except WorkerAPIError as exc:
+            if exc.status == 409:
+                raise RuntimeError("job lease lost") from None
+            if time.monotonic() - last_ok > 80:
+                raise RuntimeError("lease renewal unavailable") from None
+        except requests.RequestException:
+            if time.monotonic() - last_ok > 80:
+                raise RuntimeError("lease renewal unavailable") from None
+
+
+async def resolve_source(client, chat):
+    try:
+        return await client.get_entity(chat)
+    except (ValueError, TypeError):
+        if isinstance(chat, int) or str(chat).lstrip('-').isdigit():
+            # StringSession does not persist the entity cache. Only inspect dialogs this account can access.
+            dialogs = await client.get_dialogs(limit=200)
+            for dialog in dialogs:
+                if int(dialog.id) == int(chat):
+                    return dialog.entity
+        raise PermanentJobError("Source channel is not resolvable by the assistant. Check account access and channel reference.") from None
+
+
+async def dispatch_api(path, body, key):
+    # Work stays on the asyncio loop; concurrent/retried HTTP requests share one operation.
+    for old in [k for k, v in OPERATIONS.items() if v[0] < time.monotonic()-600 and v[1].done()]:
+        OPERATIONS.pop(old, None)
+    if key and len(key) > 200:
+        return {"ok": False, "error": "invalid_request_key"}
+    fingerprint = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    identity = (path, key)
+    if key and identity in OPERATIONS:
+        _, task, previous = OPERATIONS[identity]
+        if previous != fingerprint:
+            return {"ok": False, "error": "request_key_conflict"}
+    else:
+        if len(OPERATIONS) >= 128:
+            return {"ok": False, "error": "busy_try_again"}
+        task = asyncio.create_task(ROUTES[path](body))
+        if key:
+            OPERATIONS[identity] = (time.monotonic(), task, fingerprint)
+    return await asyncio.shield(task)
 
 
 # ---------------------------------------------------------------- jobs
@@ -131,7 +236,12 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
 
     bot_id = int(payload.get("bot_id") or 0)
     channel = await resolve_pool(client, int(pool), bot_id)
-    bot = await client.get_entity(username)
+    try:
+        bot = await client.get_entity(username)
+    except (ValueError, TypeError):
+        raise PermanentJobError("Clone bot username cannot be resolved; check its current username.") from None
+    if not getattr(bot, "bot", False) or int(bot.id) != bot_id:
+        raise PermanentJobError("Clone username does not match the expected bot identity")
 
     # No invite step. Telegram refuses to add a bot to a channel as a plain
     # member -- "Bots can only be admins in channels" -- and EditAdmin below
@@ -151,9 +261,7 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
         # next one, and promote there -- otherwise every clone created after
         # the 50th would silently fail.
         log.warning("pool %s is out of admin slots, switching", pool)
-        r = requests.post(f"{WORKER_URL}/assistant/nextpool", headers=HEADERS,
-                          json={"full": int(pool), "bot_id": bot_id},
-                          timeout=60).json()
+        r = await worker_request("POST", "nextpool", {"full": int(pool), "bot_id": bot_id, **job_fields()})
         if not r.get("ok"):
             raise RuntimeError(r.get("error") or "no free storage channel")
         pool = r["pool"]
@@ -164,8 +272,9 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
         admin_rights=BOT_RIGHTS,
         rank="storage",
     ))
-    log.info("promoted @%s", username)
+    log.info("clone promotion complete")
     _last_promote = time.time()
+    return {"pool": int(pool)}
 
 
 async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
@@ -184,9 +293,7 @@ async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
         pass
 
     log.info("not a member of pool %s yet - requesting an invite", pool)
-    r = requests.post(f"{WORKER_URL}/assistant/invite", headers=HEADERS,
-                      json={"chat": pool, "bot_id": bot_id}, timeout=60)
-    data = r.json()
+    data = await worker_request("POST", "invite", {"chat": pool, "bot_id": bot_id, **job_fields()})
     if not data.get("ok"):
         raise RuntimeError(f"could not get an invite for {pool}: {data.get('error')}")
 
@@ -199,8 +306,7 @@ async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
         log.info("already in pool %s, just needed the entity", pool)
     except FloodWaitError as e:
         log.warning("flood wait %ss joining pool", e.seconds)
-        await asyncio.sleep(min(e.seconds, 300))
-        await client(ImportChatInviteRequest(hash_))
+        raise
 
     # the join populates the session cache, so this now resolves
     entity = await client.get_entity(pool)
@@ -210,15 +316,13 @@ async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
     # new admins", and if it was not the owner has to do it once by hand.
     me = await client.get_me()
     try:
-        pr = requests.post(f"{WORKER_URL}/assistant/promote", headers=HEADERS,
-                           json={"chat": pool, "user_id": me.id, "bot_id": bot_id},
-                           timeout=60).json()
+        pr = await worker_request("POST", "promote", {"chat": pool, "user_id": me.id, "bot_id": bot_id, **job_fields()})
         if pr.get("ok"):
             log.info("promoted to admin in %s", pool)
         else:
             log.warning("could not self-promote in %s: %s", pool, pr.get("error"))
     except Exception as e:                          # noqa: BLE001
-        log.warning("promote call failed: %s", e)
+        log.warning("promotion request failed (%s)", type(e).__name__)
 
     return entity
 
@@ -294,7 +398,11 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     code = payload["code"]
     bot_id = int(payload["bot_id"])
 
-    source = await client.get_entity(chat)
+    if first < 1 or last < first or last-first > 200000:
+        raise PermanentJobError("Invalid or excessive message range")
+    source = await resolve_source(client, chat)
+    if getattr(source, "noforwards", False):
+        raise PermanentJobError("Telegram protects this source from forwarding. Use an authorized, unrestricted source.")
     dest = await resolve_pool(client, pool, bot_id)
 
     ids = list(range(first, last + 1))
@@ -318,6 +426,8 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
         # drop ids that do not exist, otherwise the whole call fails
         msgs = await client.get_messages(source, ids=chunk)
         usable = [m for m in msgs if m is not None and not m.action]
+        if any(getattr(m,"noforwards",False) for m in usable):
+            raise PermanentJobError("Telegram protects a source message from forwarding")
         if not usable:
             continue
 
@@ -341,10 +451,7 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
                 )
             except FloodWaitError as e:
                 log.warning("flood wait %ss mid-range", e.seconds)
-                await asyncio.sleep(min(e.seconds, 300))
-                fwd = await client.forward_messages(
-                    dest, run_ids, source, drop_author=not keep_tag,
-                )
+                raise
 
             # forward_messages returns None in the slots it could not deliver,
             # so the list is not 1:1 with run_ids and must be filtered
@@ -362,35 +469,21 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
             # `reset` clears the placeholder references, so it must fire on
             # the first publish of THIS attempt and never again -- a retry
             # starts from a clean slate instead of duplicating rows.
-            requests.post(
-                f"{WORKER_URL}/assistant/refs",
-                headers=HEADERS,
-                json={
-                    "bot_id": bot_id,
-                    "code": code,
-                    "chat_id": pool,
-                    "msg_ids": new_ids,
-                    "meta": new_meta,
-                    "done": False,
-                    "reset": first_publish,
-                },
-                timeout=60,
-            )
+            await worker_request("POST", "refs", {
+                "bot_id": bot_id, "code": code, "chat_id": pool,
+                "msg_ids": new_ids, "meta": new_meta, "done": False,
+                "reset": first_publish, **job_fields(),
+            })
             first_publish = False
 
     # Nothing left to add -- just mark it finished.
-    requests.post(
-        f"{WORKER_URL}/assistant/refs",
-        headers=HEADERS,
-        json={"bot_id": bot_id, "code": code, "chat_id": pool,
-              "msg_ids": [], "done": True, "reset": first_publish},
-        timeout=60,
-    )
+    await worker_request("POST", "refs", {"bot_id": bot_id, "code": code, "chat_id": pool,
+              "msg_ids": [], "done": True, "reset": first_publish, **job_fields()})
 
     log.info("fetch_range done: %d messages", sent_total)
 
 
-async def import_mongo(payload: dict) -> None:
+def import_mongo_sync(payload: dict, fields: dict) -> None:
     """
     Copy a user list out of an existing MongoDB bot into our database.
     The URI is used once and never written to disk or logs.
@@ -437,72 +530,84 @@ async def import_mongo(payload: dict) -> None:
 
         # hand them back in batches; the Worker owns all DB writes
         for i in range(0, len(ids), 500):
-            requests.post(
-                f"{WORKER_URL}/assistant/import",
-                headers=HEADERS,
-                json={"bot_id": bot_id, "users": ids[i:i + 500]},
-                timeout=30,
-            )
+            worker_request_sync("POST", "import", {"bot_id": bot_id, "users": ids[i:i + 500], **fields}, timeout=30)
     finally:
         cli.close()
         del uri
 
 
+async def import_mongo(payload: dict) -> None:
+    await asyncio.to_thread(import_mongo_sync, payload, job_fields())
+
+
 # ---------------------------------------------------------------- main loop
 async def worker_loop() -> None:
-    global CLIENT
-    client = CLIENT
-    if client is None:
-        client = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
-        await client.connect()
-        CLIENT = client
-
-    me = await client.get_me()
-    log.info("assistant signed in as %s (id %s)", me.username or me.first_name, me.id)
-
+    global CLIENT, ACTIVE_JOB
+    if CLIENT is None:
+        candidate = TelegramClient(StringSession(SESSION), API_ID, API_HASH)
+        await candidate.connect()
+        if not await candidate.is_user_authorized():
+            await candidate.disconnect()
+            raise RuntimeError("Stored Telegram session is not authorized")
+        CLIENT = candidate
     while True:
-        job = pull_job()
+        while SESSION_SWITCHING:
+            await asyncio.sleep(0.2)
+        job = await pull_job()
         if not job:
-            # wait for a knock, but never trust it as the only trigger
             try:
                 await asyncio.wait_for(WAKE.wait(), timeout=POLL_IDLE)
             except asyncio.TimeoutError:
                 pass
             WAKE.clear()
             continue
-
-        jid, kind, payload = job["id"], job["kind"], job["payload"]
-        log.info("job %s: %s", jid, kind)
-
+        while SESSION_SWITCHING:
+            await asyncio.sleep(0.2)
+        ACTIVE_JOB = job
+        client = CLIENT  # refresh after every account/session change
+        kind, payload = job["kind"], job["payload"]
+        async def perform():
+            if kind == "promote_clone": return await promote_clone(client, payload)
+            if kind == "fetch_range": return await fetch_range(client, payload)
+            if kind == "import_mongo": return await import_mongo(payload)
+            raise PermanentJobError("Unknown job kind")
+        task = asyncio.create_task(perform())
+        heartbeat = asyncio.create_task(lease_heartbeat(job)) if job.get("lease_token") else None
         try:
-            if kind == "promote_clone":
-                await promote_clone(client, payload)
-            elif kind == "fetch_range":
-                await fetch_range(client, payload)
-            elif kind == "import_mongo":
-                await import_mongo(payload)
-            else:
-                raise RuntimeError(f"unknown job kind: {kind}")
-            ack(jid, True)
-            log.info("job %s done", jid)
-
-        except FloodWaitError as e:
-            log.warning("flood wait %ss", e.seconds)
-            ack(jid, False, f"flood wait {e.seconds}s")
-            await asyncio.sleep(min(e.seconds, 300))
-
-        except Exception as e:
-            log.error("job %s failed: %s", jid, e)
-            ack(jid, False, str(e)[:300])
-
+            if heartbeat:
+                done, _ = await asyncio.wait({task, heartbeat}, return_when=asyncio.FIRST_COMPLETED)
+                if heartbeat in done:
+                    await heartbeat
+            result = await task
+            await send_ack(job, True, **(result or {}))
+            log.info("job %s completed", job["id"])
+        except asyncio.CancelledError:
+            raise
+        except FloodWaitError as exc:
+            await send_ack(job, False, "Telegram rate limit; retry scheduled", retry_after=exc.seconds+5)
+        except (ChatForwardsRestrictedError, ChannelPrivateError, ChatAdminRequiredError) as exc:
+            await send_ack(job, False, "Telegram permissions/protection prevent this operation: "+type(exc).__name__, permanent=True)
+        except PermanentJobError as exc:
+            await send_ack(job, False, str(exc), permanent=True)
+        except Exception as exc:
+            log.warning("job %s failed (%s)", job["id"], type(exc).__name__)
+            with contextlib.suppress(Exception):
+                await send_ack(job, False, "Job failed: " + type(exc).__name__)
+        finally:
+            for pending in (task, heartbeat):
+                if pending is not None:
+                    pending.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await pending
+            ACTIVE_JOB = None
         await asyncio.sleep(2)
 
 
 # ---------------------------------------------------------------- health server
 # ---------------------------------------------------------------- login API
 #
-# The owner signs in from inside the bot, so the phone number, the SMS code and
-# the 2FA password never leave Telegram. The Worker relays each step here; this
+# The owner signs in from the bot; the Worker relays login inputs here over HTTPS.
+# Never log request bodies, login inputs or session values. This
 # service is the only place a Telethon client exists.
 #
 # A login is a multi-step conversation that must keep the SAME client object
@@ -524,31 +629,46 @@ def _prune_pending() -> None:
 
 async def _login_start(phone: str) -> dict:
     _prune_pending()
+    if not re.fullmatch(r"\+\d{8,15}", str(phone)):
+        return {"ok": False, "error": "invalid_phone"}
+    if len(PENDING) >= 8:
+        return {"ok": False, "error": "too_many_pending_logins"}
     client = TelegramClient(StringSession(), API_ID, API_HASH)
-    await client.connect()
-    sent = await client.send_code_request(phone)
-    lid = os.urandom(8).hex()
-    PENDING[lid] = {"client": client, "phone": phone, "hash": sent.phone_code_hash,
-                    "at": time.time()}
+    try:
+        await client.connect()
+        sent = await client.send_code_request(phone)
+    except Exception:
+        await client.disconnect()
+        raise
+    lid = os.urandom(16).hex()
+    PENDING[lid] = {"client": client, "phone": phone, "hash": sent.phone_code_hash, "at": time.time()}
     return {"ok": True, "id": lid}
 
 
 async def _finish(client) -> dict:
-    """Persist the session in the Worker and swap it in without a restart."""
-    global SESSION, CLIENT
-    session = client.session.save()
-    me = await client.get_me()
-    who = me.username or me.first_name or str(me.id)
-    r = requests.post(f"{WORKER_URL}/assistant/session", headers=HEADERS,
-                      json={"session": session, "user": who}, timeout=30)
-    r.raise_for_status()
-    SESSION = session
-    CLIENT = client
-    log.info("signed in as %s (id %s)", me.username or me.first_name, me.id)
-    return {"ok": True, "user": me.username or me.first_name, "id": me.id}
+    global SESSION, CLIENT, SESSION_SWITCHING
+    if ACTIVE_JOB is not None or SESSION_SWITCHING:
+        return {"ok": False, "error": "assistant_busy_retry"}
+    SESSION_SWITCHING = True
+    try:
+        session = client.session.save()
+        me = await client.get_me()
+        if me is None:
+            return {"ok": False, "error": "not_authorized"}
+        who = me.username or me.first_name or str(me.id)
+        await worker_request("POST", "session", {"session": session, "user": who}, timeout=20)
+        old = CLIENT
+        SESSION, CLIENT = session, client
+        if old is not None and old is not client:
+            await old.disconnect()
+        if WAKE is not None: WAKE.set()
+        return {"ok": True, "user": me.username or me.first_name, "id": me.id}
+    finally:
+        SESSION_SWITCHING = False
 
 
 async def _login_code(lid: str, code: str) -> dict:
+    _prune_pending()
     p = PENDING.get(lid)
     if not p:
         return {"ok": False, "error": "expired"}
@@ -561,13 +681,15 @@ async def _login_code(lid: str, code: str) -> dict:
         return {"ok": False, "error": "bad_code"}
     except PhoneCodeExpiredError:
         PENDING.pop(lid, None)
+        await p["client"].disconnect()
         return {"ok": False, "error": "expired"}
     out = await _finish(p["client"])
-    PENDING.pop(lid, None)
+    if out.get("ok"): PENDING.pop(lid, None)
     return out
 
 
 async def _login_password(lid: str, password: str) -> dict:
+    _prune_pending()
     p = PENDING.get(lid)
     if not p:
         return {"ok": False, "error": "expired"}
@@ -576,7 +698,7 @@ async def _login_password(lid: str, password: str) -> dict:
     except PasswordHashInvalidError:
         return {"ok": False, "error": "bad_password"}
     out = await _finish(p["client"])
-    PENDING.pop(lid, None)
+    if out.get("ok"): PENDING.pop(lid, None)
     return out
 
 
@@ -596,64 +718,91 @@ ROUTES = {
 
 
 class Api(BaseHTTPRequestHandler):
+    def setup(self):
+        super().setup()
+        self.connection.settimeout(10)
+
     def _send(self, code: int, obj: dict) -> None:
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("content-type", "application/json")
-        self.send_header("content-length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(body)))
+            self.send_header("cache-control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, socket.timeout):
+            pass
 
-    def do_GET(self):  # noqa: N802
-        self._send(200, {"ok": True, "signed_in": SESSION is not None})
+    def do_GET(self):
+        if self.path not in ("/", "/health"):
+            return self._send(404, {"ok": False})
+        self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
+                         "protocol": 2, "version": "audit-2026-10-15"})
 
-    def do_POST(self):  # noqa: N802
-        if self.headers.get("authorization") != f"Bearer {SHARED_SECRET}":
+    def do_POST(self):
+        if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):
             return self._send(401, {"ok": False, "error": "unauthorized"})
-        route = ROUTES.get(self.path)
-        if not route:
+        if self.path not in ROUTES:
             return self._send(404, {"ok": False, "error": "no such route"})
         try:
-            n = int(self.headers.get("content-length") or 0)
+            n = int(self.headers.get("content-length", "0"))
+            if n < 0 or n > 16384:
+                return self._send(413, {"ok": False, "error": "body_too_large"})
             body = json.loads(self.rfile.read(n) or b"{}")
-            fut = asyncio.run_coroutine_threadsafe(route(body), LOOP)
-            self._send(200, fut.result(timeout=90))
-        except Exception as e:                      # noqa: BLE001
-            log.exception("login step failed")
-            self._send(200, {"ok": False, "error": str(e)[:200]})
+            if not isinstance(body, dict): raise ValueError()
+        except (ValueError, socket.timeout):
+            return self._send(400, {"ok": False, "error": "invalid_request"})
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                dispatch_api(self.path, body, self.headers.get("x-idempotency-key", "")), LOOP)
+            self._send(200, fut.result(timeout=85))
+        except TimeoutError:
+            self._send(503, {"ok": False, "error": "operation_pending_retry_same_request"})
+        except (KeyError, TypeError, ValueError):
+            self._send(400, {"ok": False, "error": "invalid_request"})
+        except Exception as exc:
+            log.warning("API operation failed (%s)", type(exc).__name__)
+            self._send(503, {"ok": False, "error": "operation_unavailable"})
 
-    def log_message(self, *args):  # silence per-request logging
+    def log_message(self, *args):
         pass
 
 
 def serve_api() -> None:
-    """Render web services must bind a port; this also wakes the dyno."""
-    HTTPServer(("0.0.0.0", PORT), Api).serve_forever()
+    ThreadingHTTPServer(("0.0.0.0", PORT), Api).serve_forever()
 
 
-def load_session() -> str | None:
+async def load_session() -> str | None:
     try:
-        r = requests.get(f"{WORKER_URL}/assistant/session", headers=HEADERS, timeout=30)
-        return r.json().get("session")
-    except Exception:                               # noqa: BLE001
-        log.warning("could not reach the worker for a session yet")
+        return (await worker_request("GET", "session")).get("session")
+    except Exception:
+        log.warning("session store unavailable; will retry")
         return None
 
 
 async def main() -> None:
-    global LOOP, SESSION, WAKE
+    global LOOP, SESSION, WAKE, CLIENT
     LOOP = asyncio.get_running_loop()
     WAKE = asyncio.Event()
     threading.Thread(target=serve_api, daemon=True).start()
-    log.info("api listening on :%s", PORT)
-
-    SESSION = load_session()
-    if not SESSION:
-        log.info("no session yet - waiting for a login from the bot")
-    while not SESSION:
-        await asyncio.sleep(5)
-
-    await worker_loop()
+    log.info("API listening on :%s", PORT)
+    while True:
+        if not SESSION:
+            SESSION = await load_session()
+        if not SESSION:
+            await asyncio.sleep(15)
+            continue
+        try:
+            await worker_loop()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            log.warning("worker loop restarting (%s)", type(exc).__name__)
+            if CLIENT is not None:
+                with contextlib.suppress(Exception): await CLIENT.disconnect()
+            CLIENT = None
+            await asyncio.sleep(10)
 
 
 if __name__ == "__main__":
