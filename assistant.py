@@ -24,6 +24,7 @@ import os
 import re
 import threading
 import time
+from urllib.parse import urlsplit, parse_qs, unquote
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
@@ -483,7 +484,21 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     log.info("fetch_range done: %d messages", sent_total)
 
 
-def import_mongo_sync(payload: dict, fields: dict) -> None:
+def validate_mongo_uri(uri):
+    try:
+        parsed = urlsplit(uri)
+        host = parsed.hostname or ""
+        query = {k.lower(): v for k, v in parse_qs(parsed.query).items()}
+        if (parsed.scheme != "mongodb+srv" or not re.fullmatch(r"[a-zA-Z0-9.-]+\.mongodb\.net", host)
+                or parsed.port is not None or not parsed.username or not parsed.password
+                or any(str(v[0]).lower() in ("false", "0") for k, v in query.items() if k in ("ssl", "tls"))):
+            raise ValueError()
+        return unquote(parsed.path.strip("/")) or None
+    except (ValueError, TypeError):
+        raise PermanentJobError("Use a TLS-enabled MongoDB Atlas mongodb+srv URI") from None
+
+
+def import_mongo_sync(payload: dict, fields: dict, stop=None) -> None:
     """
     Copy a user list out of an existing MongoDB bot into our database.
     The URI is used once and never written to disk or logs.
@@ -494,9 +509,11 @@ def import_mongo_sync(payload: dict, fields: dict) -> None:
     bot_id = payload["bot_id"]
     collection = payload.get("collection")
 
-    cli = MongoClient(uri, serverSelectionTimeoutMS=15000)
+    database = validate_mongo_uri(uri)
+    if stop is not None and stop.is_set(): return
+    cli = MongoClient(uri, serverSelectionTimeoutMS=15000, connectTimeoutMS=15000, socketTimeoutMS=15000, tls=True)
     try:
-        db_name = cli.list_database_names()
+        db_name = [database] if database else cli.list_database_names()
         target = None
 
         for name in db_name:
@@ -518,6 +535,7 @@ def import_mongo_sync(payload: dict, fields: dict) -> None:
 
         ids: list[int] = []
         for doc in target.find({}, {"id": 1, "_id": 1, "user_id": 1}).limit(200000):
+            if stop is not None and stop.is_set(): return
             raw = doc.get("id") or doc.get("user_id") or doc.get("_id")
             try:
                 n = int(raw)
@@ -530,6 +548,7 @@ def import_mongo_sync(payload: dict, fields: dict) -> None:
 
         # hand them back in batches; the Worker owns all DB writes
         for i in range(0, len(ids), 500):
+            if stop is not None and stop.is_set(): return
             worker_request_sync("POST", "import", {"bot_id": bot_id, "users": ids[i:i + 500], **fields}, timeout=30)
     finally:
         cli.close()
@@ -537,7 +556,11 @@ def import_mongo_sync(payload: dict, fields: dict) -> None:
 
 
 async def import_mongo(payload: dict) -> None:
-    await asyncio.to_thread(import_mongo_sync, payload, job_fields())
+    stop = threading.Event()
+    try:
+        await asyncio.to_thread(import_mongo_sync, payload, job_fields(), stop)
+    finally:
+        stop.set()
 
 
 # ---------------------------------------------------------------- main loop
@@ -738,7 +761,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "version": "audit-2026-10-15"})
+                         "protocol": 2, "version": "workflow-import-2026-10-15"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):

@@ -115,3 +115,22 @@ class LocalHTTPServer(unittest.TestCase):
         headers={'Authorization':'Bearer test-only-secret'}
         self.assertEqual(a.requests.post(self.base+'/wake',data='x'*17000,headers=headers,timeout=2).status_code,413)
         self.assertEqual(a.requests.post(self.base+'/wake',data='{',headers=headers,timeout=2).status_code,400)
+
+class MongoImportValidation(unittest.TestCase):
+    def test_atlas_uri_accepted_without_network(self):
+        self.assertEqual(a.validate_mongo_uri('mongodb+srv://user:dummy@sample.mongodb.net/users'), 'users')
+    def test_unsafe_hosts_plain_mongo_and_tls_disable_rejected(self):
+        for uri in ['mongodb://user:dummy@localhost/db', 'mongodb+srv://user:dummy@localhost/db',
+                    'mongodb+srv://user:dummy@mongodb.net.evil.invalid/db',
+                    'mongodb+srv://user:dummy@sample.mongodb.net/db?tls=false']:
+            with self.subTest(uri=uri):
+                with self.assertRaises(a.PermanentJobError): a.validate_mongo_uri(uri)
+    def test_invalid_uri_error_does_not_expose_credentials(self):
+        with self.assertRaises(a.PermanentJobError) as cm:
+            a.validate_mongo_uri('mongodb://sensitive-user:sensitive-password@127.0.0.1/db')
+        self.assertNotIn('sensitive', str(cm.exception))
+    def test_cancel_before_import_connects_to_nothing(self):
+        stop=a.threading.Event();stop.set()
+        with patch('pymongo.MongoClient') as client:
+            a.import_mongo_sync({'uri':'mongodb+srv://user:dummy@sample.mongodb.net/db','bot_id':1},{},stop)
+            client.assert_not_called()

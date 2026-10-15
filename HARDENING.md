@@ -33,3 +33,9 @@ The tests use dummy credentials, mocked Telegram clients and mocked Worker reque
 - Retry-safe queue completion is not a guarantee of exactly-once Telegram forwards across crashes. Historical failed jobs are not automatically replayed by this release.
 - Login request idempotency is process-local; a Render restart loses pending login state. Start a fresh login if the bot reports an expired session.
 - Never put API keys, OTPs, passwords or session strings in the repository or logs. Login inputs are relayed by the Worker over HTTPS, not confined to Telegram.
+
+## Local workflow follow-up — not deployed yet
+
+The assistant now validates MongoDB Atlas `mongodb+srv` hosts/TLS, honors the URI database, bounds connect/read timeouts, and checks cooperative cancellation between documents/batches. Worker queues credentials encrypted, releases them only to protocol-2 claims with current manager authorization, and fences import writes on cancellation/revocation. The health version is `workflow-import-2026-10-15`; protocol remains 2.
+
+25 local tests pass. No real Mongo import/session login was executed. A blocked synchronous Mongo read is not instantly interruptible; lease checks and the cooperative stop event protect subsequent writes. Use the existing free service and existing secrets; do not add instances or rotate a live session merely to publish code. Worker migration 0002 and the matching Worker should be rolled out first. See the paired Worker workflow report for complete deployment/testing limits.
