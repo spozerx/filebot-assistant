@@ -76,7 +76,7 @@ WAKE: "asyncio.Event | None" = None
 PROMOTE_GAP = int(os.getenv("PROMOTE_GAP", "45"))  # min seconds between promotions
 PORT = int(os.getenv("PORT", "10000"))
 
-HEADERS = {"Authorization": f"Bearer {SHARED_SECRET}", "X-Filebot-Protocol": "2", "X-Filebot-Storage-Protocol": "1"}
+HEADERS = {"Authorization": f"Bearer {SHARED_SECRET}", "X-Filebot-Protocol": "2", "X-Filebot-Storage-Protocol": "2"}
 
 # Rights a clone bot needs in the storage channel: post, edit and delete its
 # own stored messages. Nothing more — no member management, no invites.
@@ -412,7 +412,6 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     # Pinned destination for the entire batch; no round-robin storage.
     dest = await resolve_pool(client, pool, bot_id)
     published = int(payload.get("published_count", 0))
-    sizes = [10, 25, 50] if published == 0 else []
 
     async def publish(next_id, sources, copied, done=False):
         nonlocal cursor, published
@@ -425,7 +424,7 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
         published = int(result["total"])
 
     while cursor <= last:
-        size = sizes.pop(0) if sizes else 100
+        size = 100
         end = min(last, cursor + size - 1)
         requested = list(range(cursor, end + 1))
         messages = await client.get_messages(source, ids=requested)
@@ -437,13 +436,9 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
         if not usable:
             await publish(end + 1, [], [])
             continue
-        runs = []
-        for message in usable:
-            keep_tag = getattr(message, "reply_markup", None) is not None
-            if runs and runs[-1][0] == keep_tag:
-                runs[-1][1].append(message.id)
-            else:
-                runs.append((keep_tag, [message.id]))
+        # Keep one maximal operation even when some messages carry keyboards.
+        # Forward the whole chunk with attribution when needed to preserve those buttons.
+        runs = [(any(getattr(m, 'reply_markup', None) is not None for m in usable), [m.id for m in usable])]
         for index, (keep_tag, ids) in enumerate(runs):
             # Ordered MTProto batches keep normal storage throughput high; no artificial pause.
             result = await client.forward_messages(dest, ids, source, drop_author=not keep_tag)
@@ -466,6 +461,22 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
             await publish(next_id, ids, copied)
     await publish(last+1, [], [], done=True)
     log.info("checkpointed storage complete: %d confirmed messages", published)
+
+
+async def hydrate_storage(client, payload):
+    if payload.get("metadata_done"):
+        return
+    dest = await resolve_pool(client, int(payload["pool"]), int(payload["bot_id"]))
+    refs = payload["refs"]
+    if not isinstance(refs, list) or not 1 <= len(refs) <= 100:
+        raise PermanentJobError("Invalid metadata batch")
+    messages = await client.get_messages(dest, ids=[ref["message_id"] for ref in refs])
+    by_id = {m.id: m for m in messages if m is not None}
+    if any(ref["message_id"] not in by_id for ref in refs):
+        raise PermanentJobError("A stored message is unavailable for metadata inspection")
+    rows = [{**file_meta(by_id[ref["message_id"]]), **ref} for ref in refs]
+    await worker_request("POST", "storage-meta", {"bot_id": payload["bot_id"], "code": payload["code"],
+        "chat_id": payload["pool"], "rows": rows, **job_fields()})
 
 
 async def fetch_range_legacy(client: TelegramClient, payload: dict) -> None:
@@ -500,7 +511,7 @@ async def fetch_range_legacy(client: TelegramClient, payload: dict) -> None:
     # is sitting there watching nothing. Starting small gets delivery moving
     # almost immediately, then the batches grow to the efficient size.
     def batches(seq: list[int]):
-        sizes, i = [10, 25, 50], 0
+        sizes, i = [], 0
         while i < len(seq):
             n = sizes.pop(0) if sizes else 100
             yield seq[i:i + n]
@@ -676,6 +687,7 @@ async def worker_loop() -> None:
         async def perform():
             if kind == "promote_clone": return await promote_clone(client, payload)
             if kind == "fetch_range": return await fetch_range(client, payload)
+            if kind == "hydrate_storage": return await hydrate_storage(client,payload)
             if kind == "import_mongo": return await import_mongo(payload)
             raise PermanentJobError("Unknown job kind")
         task = asyncio.create_task(perform())
@@ -707,7 +719,8 @@ async def worker_loop() -> None:
                     with contextlib.suppress(asyncio.CancelledError, Exception):
                         await pending
             ACTIVE_JOB = None
-        await asyncio.sleep(2)
+        if kind not in ("fetch_range", "hydrate_storage"):
+            await asyncio.sleep(2)
 
 
 # ---------------------------------------------------------------- health server
@@ -845,7 +858,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "storage_protocol": 1, "version": "storage-first-2026-10-15"})
+                         "protocol": 2, "storage_protocol": 2, "version": "bulk-storage-2026-10-15"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):
