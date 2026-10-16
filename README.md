@@ -2,11 +2,13 @@
 
 **Current deployed-session policy:** keep the existing session stored by the Worker; do not generate a new session or change environment variables for this update. The legacy first-install notes below are not a redeployment instruction.
 
+**Storage reliability follow-up (2026-10-16):** `storage-cancel-2026-10-16`, unchanged protocol 2/storage capability 2. Empty Telegram message objects are not counted as copied files or hydrated metadata. Legacy queued ranges also keep compatible mixed-keyboard chunks in one up-to-100-message operation. No deliberate storage sleep was added. The matching Worker implements the revised one-second italic `cancelled` notice and moves optional wake HTTP requests off the storage critical path. **41 assistant tests pass.** Existing migrations 0001/0002/0003 are already applied; no migration or environment/session change for this follow-up.
+
 **Bulk-storage update (2026-10-15):** general protocol 2, `X-Filebot-Storage-Protocol: 2`. Storage ranges start at **100**, immediately process subsequent chunks, and have no two-second inter-storage-job pause. One pinned destination and fenced atomic Worker checkpoints remain. Mixed keyboard chunks stay in one operation with attribution retained when required. No old-link repair/requeue or protected-content bypass.
 
 New `hydrate_storage` jobs read up to 100 already-stored messages in one call to recover caption metadata without copying again. The Worker gates caption-dependent delivery until these exact references are hydrated. Older storage-capability-1 consumers cannot claim these jobs from the matching Worker. Already committed metadata is not fetched again on an ACK retry.
 
-Before deploying the matching Worker, apply its additive migration **0003 once**, not 0001/0002. Preserve Render Free, one instance, original start command, all environment variables and the existing Telegram session. Tests: `.venv/bin/python -m unittest discover -s tests -v` (**37 tests**). Local tests mock Telegram; 100 is the batch size, not a measured 100-files/second guarantee. Response/checkpoint loss can still leave untracked copies. Source-unavailable errors, flood waits and platform scheduling limits still apply.
+The preceding bulk release applied migration **0003 once**; do not rerun it or 0001/0002. Preserve Render Free, one instance, original start command, all environment variables and the existing Telegram session. Tests: `.venv/bin/python -m unittest discover -s tests -v` (**41 tests**). Local tests mock Telegram; 100 is the batch size, not a measured 100-files/second guarantee. Response/checkpoint loss can still leave untracked copies. Source-unavailable errors, flood waits and platform scheduling limits still apply.
 
 This small service does the one thing the Cloudflare Worker cannot: **add a
 clone bot as an admin to the storage channel.** The Telegram Bot API has no

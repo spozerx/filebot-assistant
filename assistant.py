@@ -44,7 +44,7 @@ from telethon.errors import (
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import EditAdminRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
-from telethon.tl.types import ChatAdminRights
+from telethon.tl.types import ChatAdminRights, MessageEmpty
 
 logging.basicConfig(
     level=logging.INFO,
@@ -428,7 +428,7 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
         end = min(last, cursor + size - 1)
         requested = list(range(cursor, end + 1))
         messages = await client.get_messages(source, ids=requested)
-        usable = sorted((m for m in messages if m is not None and not getattr(m, "action", None)), key=lambda m: m.id)
+        usable = sorted((m for m in messages if m is not None and not isinstance(m, MessageEmpty) and not getattr(m, "action", None)), key=lambda m: m.id)
         if any(m.id not in requested for m in usable) or len({m.id for m in usable}) != len(usable):
             raise PermanentJobError("Unexpected source message ordering")
         if any(getattr(m, "noforwards", False) for m in usable):
@@ -443,13 +443,13 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
             # Ordered MTProto batches keep normal storage throughput high; no artificial pause.
             result = await client.forward_messages(dest, ids, source, drop_author=not keep_tag)
             copied = result if isinstance(result, list) else [result]
-            complete = len(copied) == len(ids) and all(m is not None for m in copied)
+            complete = len(copied) == len(ids) and all(m is not None and not isinstance(m, MessageEmpty) for m in copied)
             if not complete:
                 # Never silently count a partial forward as complete. Commit only the known
                 # leading prefix, then stop for an explicit operator-visible failure.
                 prefix = []
                 for message in copied[:len(ids)]:
-                    if message is None:
+                    if message is None or isinstance(message, MessageEmpty):
                         break
                     prefix.append(message)
                 if prefix and len(copied) == len(ids):
@@ -471,7 +471,7 @@ async def hydrate_storage(client, payload):
     if not isinstance(refs, list) or not 1 <= len(refs) <= 100:
         raise PermanentJobError("Invalid metadata batch")
     messages = await client.get_messages(dest, ids=[ref["message_id"] for ref in refs])
-    by_id = {m.id: m for m in messages if m is not None}
+    by_id = {m.id: m for m in messages if m is not None and not isinstance(m, MessageEmpty)}
     if any(ref["message_id"] not in by_id for ref in refs):
         raise PermanentJobError("A stored message is unavailable for metadata inspection")
     rows = [{**file_meta(by_id[ref["message_id"]]), **ref} for ref in refs]
@@ -506,39 +506,24 @@ async def fetch_range_legacy(client: TelegramClient, payload: dict) -> None:
 
     sent_total = 0
     first_publish = True
-    # Ramped batch sizes. A flat 100 is best for raw throughput but it means
-    # the first file does not reach the user for several seconds; the reader
-    # is sitting there watching nothing. Starting small gets delivery moving
-    # almost immediately, then the batches grow to the efficient size.
+    # Legacy queued ranges also use maximum-size chunks, without a warm-up.
     def batches(seq: list[int]):
-        sizes, i = [], 0
-        while i < len(seq):
-            n = sizes.pop(0) if sizes else 100
-            yield seq[i:i + n]
-            i += n
+        for i in range(0,len(seq),100):
+            yield seq[i:i+100]
 
     for chunk in batches(ids):
 
         # drop ids that do not exist, otherwise the whole call fails
         msgs = await client.get_messages(source, ids=chunk)
-        usable = [m for m in msgs if m is not None and not m.action]
+        usable = sorted((m for m in msgs if m is not None and not isinstance(m, MessageEmpty) and not getattr(m, "action", None)), key=lambda m:m.id)
         if any(getattr(m,"noforwards",False) for m in usable):
             raise PermanentJobError("Telegram protects a source message from forwarding")
         if not usable:
             continue
 
-        # A clean copy (drop_author) is what we want in storage: no
-        # "Forwarded from" header leaking the source channel. The one thing a
-        # copy loses is the inline keyboard, so messages that carry buttons
-        # have to be forwarded properly, tag and all. Consecutive messages of
-        # the same kind are batched so ordering is preserved either way.
-        runs: list[tuple[bool, list[int]]] = []
-        for m in usable:
-            keep_tag = m.reply_markup is not None
-            if runs and runs[-1][0] == keep_tag:
-                runs[-1][1].append(m.id)
-            else:
-                runs.append((keep_tag, [m.id]))
+        # Keep one ordered operation per chunk. Preserve keyboards by retaining
+        # attribution for the whole chunk when any source message needs it.
+        runs=[(any(getattr(m,"reply_markup",None) is not None for m in usable),[m.id for m in usable])]
 
         for keep_tag, run_ids in runs:
             try:
@@ -551,7 +536,7 @@ async def fetch_range_legacy(client: TelegramClient, payload: dict) -> None:
 
             # forward_messages returns None in the slots it could not deliver,
             # so the list is not 1:1 with run_ids and must be filtered
-            got = [m for m in (fwd if isinstance(fwd, list) else [fwd]) if m is not None]
+            got = [m for m in (fwd if isinstance(fwd, list) else [fwd]) if m is not None and not isinstance(m, MessageEmpty)]
             new_ids = [m.id for m in got]
             new_meta = [file_meta(m) for m in got]
             sent_total += len(new_ids)
@@ -858,7 +843,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "storage_protocol": 2, "version": "bulk-storage-2026-10-15"})
+                         "protocol": 2, "storage_protocol": 2, "version": "storage-cancel-2026-10-16"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):

@@ -97,3 +97,26 @@ class CheckpointStorage(unittest.IsolatedAsyncioTestCase):
         client=self.client()
         with patch.object(a,'resolve_pool',AsyncMock()) as resolve:await a.hydrate_storage(client,{'metadata_done':1})
         resolve.assert_not_called();client.get_messages.assert_not_called()
+
+    async def test_empty_telegram_source_slots_are_skipped_not_forwarded(self):
+        self.payload['to']=3;client=self.client()
+        client.get_messages=AsyncMock(return_value=[self.message(3),a.MessageEmpty(id=2,peer_id=None),self.message(1)])
+        await self.execute(client);self.assertEqual(self.sent,[1,3]);self.assertEqual(self.total,2);self.assertTrue(self.published[-1]['done'])
+
+    async def test_empty_storage_metadata_slot_is_not_marked_hydrated(self):
+        client=self.client();client.get_messages=AsyncMock(return_value=[a.MessageEmpty(id=1001,peer_id=None)])
+        with patch.object(a,'resolve_pool',AsyncMock(return_value='storage')),patch.object(a,'worker_request',AsyncMock()) as request:
+            with self.assertRaises(a.PermanentJobError):await a.hydrate_storage(client,{'bot_id':1,'code':'batch','pool':-100,'refs':[{'file_pk':1,'message_id':1001}]})
+        request.assert_not_called()
+
+    async def test_empty_forward_result_is_not_counted_as_a_stored_file(self):
+        self.payload['to']=2;client=self.client();client.forward_messages=AsyncMock(return_value=[self.message(1001),a.MessageEmpty(id=1002,peer_id=None)])
+        with self.assertRaises(a.PermanentJobError):await self.execute(client)
+        self.assertEqual(self.total,1);self.assertFalse(any(x['done'] for x in self.published))
+
+    async def test_legacy_mixed_keyboard_range_uses_one_full_batch_without_warmup(self):
+        client=self.client();client.get_messages=AsyncMock(return_value=[self.message(i,buttons=i%2==0) for i in range(100,0,-1)])
+        payload={**self.payload};payload.pop('storage_version')
+        with patch.object(a,'resolve_source',AsyncMock(return_value=SimpleNamespace(noforwards=False))),patch.object(a,'resolve_pool',AsyncMock(return_value='storage')),patch.object(a,'worker_request',AsyncMock(return_value={'ok':True})),patch.object(a.asyncio,'sleep',AsyncMock()) as sleep:
+            await a.fetch_range(client,payload)
+        self.assertEqual(client.forward_messages.await_count,1);self.assertEqual(self.sent,list(range(1,101)));self.assertFalse(client.forward_messages.await_args.kwargs['drop_author']);sleep.assert_not_called()
