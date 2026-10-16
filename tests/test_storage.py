@@ -120,3 +120,10 @@ class CheckpointStorage(unittest.IsolatedAsyncioTestCase):
         with patch.object(a,'resolve_source',AsyncMock(return_value=SimpleNamespace(noforwards=False))),patch.object(a,'resolve_pool',AsyncMock(return_value='storage')),patch.object(a,'worker_request',AsyncMock(return_value={'ok':True})),patch.object(a.asyncio,'sleep',AsyncMock()) as sleep:
             await a.fetch_range(client,payload)
         self.assertEqual(client.forward_messages.await_count,1);self.assertEqual(self.sent,list(range(1,101)));self.assertFalse(client.forward_messages.await_args.kwargs['drop_author']);sleep.assert_not_called()
+    async def test_fetch_range_propagates_notice_msg_and_total_to_checkpoint(self):
+            client = self.client()
+            payload = {**self.payload, 'notice_msg': 4321, 'total': 100}
+            await self.execute(client, payload=payload)
+            self.assertEqual(len(self.published), 2)
+            self.assertTrue(all(b.get('notice_msg') == 4321 for b in self.published))
+            self.assertTrue(all(b.get('total') == 100 for b in self.published))

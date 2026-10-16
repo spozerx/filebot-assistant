@@ -419,6 +419,10 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
                 "expected_next_id": cursor, "next_id": next_id, "source_ids": sources,
                 "msg_ids": [m.id for m in copied], "meta": [file_meta(m) for m in copied],
                 "done": done, **job_fields()}
+        if payload.get("notice_msg") is not None:
+            body["notice_msg"] = payload["notice_msg"]
+        if payload.get("total") is not None:
+            body["total"] = payload["total"]
         result = await publish_storage_checkpoint(body)
         cursor = int(result["next_id"])
         published = int(result["total"])
@@ -843,7 +847,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "storage_protocol": 2, "version": "storage-cancel-2026-10-16"})
+                         "protocol": 2, "storage_protocol": 2, "version": "batch-ui-broadcast-2026-10-16"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):
