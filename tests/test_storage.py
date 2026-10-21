@@ -11,7 +11,9 @@ class CheckpointStorage(unittest.IsolatedAsyncioTestCase):
     def message(self,id,buttons=False):
         return SimpleNamespace(id=id,action=None,noforwards=False,reply_markup=object() if buttons else None)
     def client(self):
-        async def get(source,ids):return [self.message(i) for i in reversed(ids)]
+        async def get(source,ids=None,limit=None,min_id=None):
+            if ids is None:return []  # storage channel read-back (only used to verify unanswered forwards)
+            return [self.message(i) for i in reversed(ids)]
         async def forward(dest,ids,source,**kwargs):
             self.sent.extend(ids);return [self.message(1000+i) for i in ids]
         return SimpleNamespace(get_messages=AsyncMock(side_effect=get),forward_messages=AsyncMock(side_effect=forward))
@@ -69,7 +71,7 @@ class CheckpointStorage(unittest.IsolatedAsyncioTestCase):
         client.forward_messages.assert_not_called()
     async def test_keyboard_runs_keep_source_order_and_same_destination(self):
         client=self.client()
-        async def get(source,ids):return [self.message(i,buttons=(i in [2,3])) for i in reversed(ids)]
+        async def get(source,ids=None,**kw):return [] if ids is None else [self.message(i,buttons=(i in [2,3])) for i in reversed(ids)]
         client.get_messages.side_effect=get;await self.execute(client,{**self.payload,'to':4})
         self.assertEqual(self.sent,[1,2,3,4]);self.assertEqual([call.args[1] for call in client.forward_messages.await_args_list],[[1,2,3,4]])
         self.assertTrue(all(call.args[0]=='pinned-storage' and call.kwargs['drop_author'] is False for call in client.forward_messages.await_args_list))

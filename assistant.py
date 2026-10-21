@@ -29,6 +29,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import requests
 from telethon import TelegramClient
+from telethon import errors as tg_errors
 from telethon.errors import (
     FloodWaitError,
     ChatForwardsRestrictedError,
@@ -398,6 +399,127 @@ async def publish_storage_checkpoint(body):
         await asyncio.sleep(0.25 * (2 ** attempt))
 
 
+
+# ---------------------------------------------------------------- confirmed forwarding
+# Telegram sometimes answers a large forward with WORKER_BUSY_TOO_LONG_RETRY (or a
+# timeout) although it carries the forward out a few seconds later. Telethon then gives
+# up with "ValueError: Request was unsuccessful". Treating that as "nothing happened"
+# left real copies in storage that were never published (Completed stayed at 0), and
+# every job retry copied the same files again. So an unanswered forward is never
+# guessed: the storage channel is read back and only copies that are really there,
+# matched to their source message and in order, are published. Whatever is still
+# missing is retried in smaller groups, which Telegram handles within its time limit.
+FORWARD_STEPS = (100, 20, 5, 1)
+FORWARD_ATTEMPTS_WITHOUT_PROGRESS = 4
+FORWARD_SETTLE_SECONDS = (3, 6)
+UNCONFIRMED_ERRORS = (
+    ValueError,                      # Telethon: "Request was unsuccessful N time(s)"
+    tg_errors.ServerError,           # includes WorkerBusyTooLongRetryError
+    tg_errors.RpcCallFailError,
+    asyncio.TimeoutError,
+    ConnectionError,
+) + tuple(e for e in (getattr(tg_errors, "TimedOutError", None),
+                      getattr(tg_errors, "InterdcCallErrorError", None)) if e is not None)
+
+
+class StorageNotConfirmed(RuntimeError):
+    """Telegram kept failing to confirm storage copies; the job is retried later."""
+
+
+def _media_key(m):
+    media = getattr(m, "media", None)
+    # A link preview is not a stored file and may be rebuilt on copy: match by text only.
+    if media is None or type(media).__name__ in ("MessageMediaWebPage", "MessageMediaEmpty"):
+        return None
+    for attr in ("photo", "document"):
+        obj = getattr(media, attr, None)
+        if obj is not None and getattr(obj, "id", None) is not None:
+            return (attr, obj.id)
+    return (type(media).__name__,)
+
+
+def copy_signature(m):
+    """Forwarded copies keep the same photo/document id and caption as the source."""
+    return (_media_key(m), (getattr(m, "message", None) or "").strip())
+
+
+def _real(messages):
+    return sorted((m for m in (messages or []) if m is not None and not isinstance(m, MessageEmpty)
+                   and not getattr(m, "action", None)), key=lambda m: m.id)
+
+
+async def latest_message_id(client, dest) -> int:
+    newest = await client.get_messages(dest, limit=1)
+    newest = [m for m in (newest or []) if m is not None and not isinstance(m, MessageEmpty)]
+    return int(newest[0].id) if newest else 0
+
+
+async def landed_copies(client, dest, after_id: int, sources: list) -> list:
+    """Copies of `sources` (in order) that reached `dest` after message `after_id`."""
+    window = _real(await client.get_messages(dest, min_id=after_id, limit=min(400, len(sources) * 3 + 50)))
+    found, j = [], 0
+    for src in sources:
+        sig = copy_signature(src)
+        while j < len(window) and copy_signature(window[j]) != sig:
+            j += 1
+        if j >= len(window):
+            break
+        found.append(window[j])
+        j += 1
+    return found
+
+
+@contextlib.contextmanager
+def few_internal_retries(client, retries=1):
+    # Telethon re-sends an unanswered request about 6 times (~40 s) before failing. Two tries
+    # are enough here because the outcome is verified by reading the storage channel.
+    old = getattr(client, "_request_retries", None)
+    if old is not None:
+        client._request_retries = retries
+    try:
+        yield
+    finally:
+        if old is not None:
+            client._request_retries = old
+
+
+async def forward_confirmed(client, dest, source, part: list, keep_tag: bool, after_id: int):
+    """
+    Forward `part` (source Message objects, ascending). Returns (copies, status):
+      "ok"          every message copied; copies align with part
+      "incomplete"  Telegram answered with gaps; copies is the aligned leading prefix
+      "unconfirmed" Telegram did not answer; copies is what verifiably landed (prefix)
+    """
+    ids = [m.id for m in part]
+    try:
+        with few_internal_retries(client):
+            result = await client.forward_messages(dest, ids, source, drop_author=not keep_tag)
+    except FloodWaitError:
+        raise
+    except UNCONFIRMED_ERRORS as exc:
+        log.warning("storage forward of %d unconfirmed (%s); checking storage", len(ids), type(exc).__name__)
+        found = []
+        for wait in FORWARD_SETTLE_SECONDS:
+            await asyncio.sleep(wait)
+            again = await landed_copies(client, dest, after_id, part)
+            if len(again) <= len(found) and found:
+                break
+            found = again
+            if len(found) == len(part):
+                break
+        log.info("storage check: %d of %d forwarded copies found", len(found), len(part))
+        return found, "unconfirmed"
+    copied = result if isinstance(result, list) else [result]
+    if len(copied) == len(ids) and all(m is not None and not isinstance(m, MessageEmpty) for m in copied):
+        return copied, "ok"
+    prefix = []
+    if len(copied) == len(ids):
+        for message in copied:
+            if message is None or isinstance(message, MessageEmpty):
+                break
+            prefix.append(message)
+    return prefix, "incomplete"
+
 async def fetch_range(client: TelegramClient, payload: dict) -> None:
     if payload.get("storage_version") != 1:
         return await fetch_range_legacy(client, payload)
@@ -412,6 +534,7 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     # Pinned destination for the entire batch; no round-robin storage.
     dest = await resolve_pool(client, pool, bot_id)
     published = int(payload.get("published_count", 0))
+    after_id = None  # newest storage message before our next forward (for verification)
 
     async def publish(next_id, sources, copied, done=False):
         nonlocal cursor, published
@@ -440,29 +563,33 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
         if not usable:
             await publish(end + 1, [], [])
             continue
-        # Keep one maximal operation even when some messages carry keyboards.
-        # Forward the whole chunk with attribution when needed to preserve those buttons.
-        runs = [(any(getattr(m, 'reply_markup', None) is not None for m in usable), [m.id for m in usable])]
-        for index, (keep_tag, ids) in enumerate(runs):
+        # Keep one maximal operation even when some messages carry keyboards: forward the
+        # whole chunk with attribution when needed to preserve those buttons.
+        keep_tag = any(getattr(m, 'reply_markup', None) is not None for m in usable)
+        todo, step, stalls = list(usable), 0, 0
+        if after_id is None:
+            after_id = await latest_message_id(client, dest)
+        while todo:
+            part = todo[:FORWARD_STEPS[step]]
             # Ordered MTProto batches keep normal storage throughput high; no artificial pause.
-            result = await client.forward_messages(dest, ids, source, drop_author=not keep_tag)
-            copied = result if isinstance(result, list) else [result]
-            complete = len(copied) == len(ids) and all(m is not None and not isinstance(m, MessageEmpty) for m in copied)
-            if not complete:
-                # Never silently count a partial forward as complete. Commit only the known
-                # leading prefix, then stop for an explicit operator-visible failure.
-                prefix = []
-                for message in copied[:len(ids)]:
-                    if message is None or isinstance(message, MessageEmpty):
-                        break
-                    prefix.append(message)
-                if prefix and len(copied) == len(ids):
-                    await publish(ids[len(prefix)-1]+1, ids[:len(prefix)], prefix)
-                raise PermanentJobError("Telegram returned an incomplete storage batch; remaining files were not marked stored")
+            copied, status = await forward_confirmed(client, dest, source, part, keep_tag, after_id)
             if any(not isinstance(m.id, int) or m.id <= 0 or (i and m.id <= copied[i-1].id) for i, m in enumerate(copied)):
                 raise PermanentJobError("Unexpected destination message ordering")
-            next_id = end+1 if index == len(runs)-1 else ids[-1]+1
-            await publish(next_id, ids, copied)
+            if copied:
+                done_all = len(copied) == len(todo)
+                await publish(end + 1 if done_all else part[len(copied)-1].id + 1, [m.id for m in part[:len(copied)]], copied)
+                after_id = max(after_id, copied[-1].id)
+                todo = todo[len(copied):]
+                stalls = 0
+            if status == "incomplete":
+                # Never silently count a partial forward as complete: only the confirmed
+                # leading prefix was published; stop for an explicit operator-visible failure.
+                raise PermanentJobError("Telegram returned an incomplete storage batch; remaining files were not marked stored")
+            if status == "unconfirmed" and todo:
+                stalls += 0 if copied else 1
+                if stalls >= FORWARD_ATTEMPTS_WITHOUT_PROGRESS:
+                    raise StorageNotConfirmed("Telegram did not confirm the storage copy")
+                step = min(step + 1, len(FORWARD_STEPS) - 1)
     await publish(last+1, [], [], done=True)
     log.info("checkpointed storage complete: %d confirmed messages", published)
 
@@ -697,6 +824,8 @@ async def worker_loop() -> None:
             await send_ack(job, False, "Telegram permissions/protection prevent this operation: "+type(exc).__name__, permanent=True)
         except PermanentJobError as exc:
             await send_ack(job, False, str(exc), permanent=True)
+        except StorageNotConfirmed as exc:
+            await send_ack(job, False, str(exc), retry_after=60)
         except Exception as exc:
             log.warning("job %s failed (%s)", job["id"], type(exc).__name__)
             with contextlib.suppress(Exception):
@@ -847,7 +976,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "storage_protocol": 2, "version": "batch-ui-broadcast-2026-10-16"})
+                         "protocol": 2, "storage_protocol": 2, "version": "storage-confirm-2026-10-21"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):
