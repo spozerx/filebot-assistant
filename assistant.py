@@ -660,6 +660,17 @@ async def fast_storage(client, payload):
     return None
 
 
+UNFORWARDABLE_MEDIA = {"MessageMediaGiveaway", "MessageMediaGiveawayResults", "MessageMediaInvoice",
+                       "MessageMediaPaidMedia", "MessageMediaUnsupported"}
+
+
+def forwardable(m) -> bool:
+    if getattr(m, "noforwards", False):
+        return False
+    media = getattr(m, "media", None)
+    return media is None or type(media).__name__ not in UNFORWARDABLE_MEDIA
+
+
 async def fetch_range(client: TelegramClient, payload: dict) -> None:
     if payload.get("storage_version") != 1:
         return await fetch_range_legacy(client, payload)
@@ -702,8 +713,13 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
         usable = sorted((m for m in messages if m is not None and not isinstance(m, MessageEmpty) and not getattr(m, "action", None)), key=lambda m: m.id)
         if any(m.id not in requested for m in usable) or len({m.id for m in usable}) != len(usable):
             raise PermanentJobError("Unexpected source message ordering")
-        if any(getattr(m, "noforwards", False) for m in usable):
-            raise PermanentJobError("Telegram protects a source message from forwarding")
+        # A protected post (e.g. sent by a bot with protect_content) or an uncopyable kind
+        # (giveaway, invoice, paid media) can be copied by nobody. One such post made Telegram
+        # refuse the whole 100, so skip it like a deleted message and forward the rest at once.
+        skipped = [m.id for m in usable if not forwardable(m)]
+        if skipped:
+            log.info("skipping %d unforwardable source message(s): %s", len(skipped), skipped[:10])
+            usable = [m for m in usable if forwardable(m)]
         if not usable:
             await publish(end + 1, [], [])
             continue
@@ -1217,7 +1233,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "storage_protocol": 2, "version": "fast-pool-2026-10-21"})
+                         "protocol": 2, "storage_protocol": 2, "version": "store-handoff-2026-10-21"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):

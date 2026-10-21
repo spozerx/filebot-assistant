@@ -129,3 +129,19 @@ class CheckpointStorage(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(self.published), 2)
             self.assertTrue(all(b.get('notice_msg') == 4321 for b in self.published))
             self.assertTrue(all(b.get('total') == 100 for b in self.published))
+
+
+
+async def _skip_unforwardable(self):
+    bad = {5: dict(noforwards=True), 9: dict(media=type('MessageMediaGiveaway', (), {})())}
+    def message(id, buttons=False):
+        return SimpleNamespace(**{**dict(id=id, action=None, noforwards=False, reply_markup=None), **bad.get(id, {})})
+    self.message = message
+    client = self.client()
+    await self.execute(client, {**self.payload, 'to': 12})
+    self.assertEqual(client.forward_messages.await_count, 1)
+    self.assertEqual(self.sent, [i for i in range(1, 13) if i not in bad])
+    self.assertTrue(self.published[-1]['done'])
+    self.assertEqual(self.total, 10)
+    self.assertEqual(self.published[0]['source_ids'], [i for i in range(1, 13) if i not in bad])
+CheckpointStorage.test_protected_and_uncopyable_posts_are_skipped_and_the_rest_forwarded_in_one_call = _skip_unforwardable
