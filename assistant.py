@@ -43,7 +43,7 @@ from telethon.errors import (
     UserAlreadyParticipantError,
 )
 from telethon.sessions import StringSession
-from telethon.tl.functions.channels import EditAdminRequest
+from telethon.tl.functions.channels import CreateChannelRequest, EditAdminRequest
 from telethon.tl.functions.messages import ForwardMessagesRequest, ImportChatInviteRequest
 from telethon.tl.types import ChatAdminRights, MessageEmpty
 
@@ -583,6 +583,83 @@ async def forward_chunk(client, dest, source, part: list, keep_tag: bool, after_
             task.cancel()
 
 
+# ---------------------------------------------------------------- own fast storage channel
+# Measured on the live account (Oct 21): 100 messages forwarded in ONE request land in ~4 s
+# in a channel this account created, but trickle in at ~0.4/s (WORKER_BUSY) into the shared
+# "Storage pool" it merely joined as an admin. So storage goes to the account's own channel;
+# the clone bot is made an admin there so it can copy the files out for delivery.
+FAST_POOL_TITLE = "Filebot fast storage"
+FAST_POOLS: list | None = None   # own channels, newest first (cached for the process)
+_LIMIT_ERRORS = tuple(e for e in (AdminsTooMuchError, getattr(tg_errors, "BotsTooMuchError", None),
+                                  getattr(tg_errors, "ChannelsAdminPublicTooMuchError", None)) if e is not None)
+
+
+def channel_chat_id(chan) -> int:
+    """Bot API id of a channel: -100 followed by the channel id."""
+    return -(10 ** 12) - int(chan.id)
+
+
+async def own_storage_channels(client) -> list:
+    global FAST_POOLS
+    if FAST_POOLS is None:
+        found = []
+        async for d in client.iter_dialogs():
+            e = d.entity
+            if (getattr(e, "broadcast", False) and getattr(e, "creator", False) and not getattr(e, "left", False)
+                    and getattr(e, "title", "") == FAST_POOL_TITLE):
+                found.append(e)
+        FAST_POOLS = sorted(found, key=lambda e: -int(e.id))
+    return FAST_POOLS
+
+
+async def create_storage_channel(client):
+    made = await client(CreateChannelRequest(title=FAST_POOL_TITLE, broadcast=True,
+                                             about="Storage for file links. Do not delete or leave."))
+    chan = made.chats[0]
+    (await own_storage_channels(client)).insert(0, chan)
+    log.info("created own storage channel %s", channel_chat_id(chan))
+    return chan
+
+
+async def fast_storage(client, payload):
+    """
+    (entity, chat_id) of an own channel the clone bot can deliver from, with the job moved
+    there by the Worker; None keeps the assigned pool (old behaviour) if anything fails.
+    """
+    try:
+        candidates = list(await own_storage_channels(client))
+        if not candidates:
+            candidates = [await create_storage_channel(client)]
+        for attempt, chan in enumerate(candidates + [None]):
+            if chan is None:
+                chan = await create_storage_channel(client)
+            chat_id = channel_chat_id(chan)
+            r = await worker_request("POST", "repool", {"chat_id": chat_id, **job_fields()})
+            if not r.get("accepted") and r.get("need_admin") and r.get("bot_username"):
+                bot = await client.get_entity(r["bot_username"])
+                if not getattr(bot, "bot", False) or int(bot.id) != int(payload["bot_id"]):
+                    log.warning("fast storage: clone username does not match the bot")
+                    return None
+                try:
+                    await client(EditAdminRequest(channel=chan, user_id=bot, admin_rights=BOT_RIGHTS, rank="storage"))
+                except _LIMIT_ERRORS:
+                    continue            # this channel is full of admins: try the next / a new one
+                r = await worker_request("POST", "repool", {"chat_id": chat_id, **job_fields()})
+            if r.get("accepted"):
+                return chan, chat_id
+            log.warning("fast storage not accepted: %s", r.get("error") or r)
+            return None
+    except FloodWaitError as exc:
+        log.warning("fast storage unavailable for now (flood wait %ss); using the assigned pool", exc.seconds)
+    except WorkerAPIError as exc:
+        if exc.status == 409:
+            raise
+        log.warning("fast storage unavailable (Worker %s); using the assigned pool", exc.status)
+    except Exception as exc:  # noqa: BLE001 - never block storage on this optimisation
+        log.warning("fast storage unavailable (%s); using the assigned pool", type(exc).__name__)
+    return None
+
+
 async def fetch_range(client: TelegramClient, payload: dict) -> None:
     if payload.get("storage_version") != 1:
         return await fetch_range_legacy(client, payload)
@@ -594,8 +671,12 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     source = await resolve_source(client, payload["chat"])
     if getattr(source, "noforwards", False):
         raise PermanentJobError("Telegram protects this source from forwarding")
-    # Pinned destination for the entire batch; no round-robin storage.
-    dest = await resolve_pool(client, pool, bot_id)
+    # Pinned destination for the entire batch: the account's own channel (fast), else the pool.
+    fast = await fast_storage(client, payload)
+    if fast is not None:
+        dest, pool = fast
+    else:
+        dest = await resolve_pool(client, pool, bot_id)
     published = int(payload.get("published_count", 0))
     after_id = None  # newest storage message before our next forward (for verification)
 
@@ -1124,7 +1205,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "storage_protocol": 2, "version": "no-dup-2026-10-21"})
+                         "protocol": 2, "storage_protocol": 2, "version": "fast-pool-2026-10-21"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):

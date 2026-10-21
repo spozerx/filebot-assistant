@@ -16,6 +16,10 @@ async def _test_invoke_forward(client,req,dest):
     if isinstance(log,list):log.append((list(req.id),list(req.random_id)))
     return await client.forward_messages(dest,list(req.id),req.from_peer,drop_author=req.drop_author)
 a._invoke_forward=_test_invoke_forward
+# Older storage tests target the assigned pool; the own fast channel is tested on its own.
+a._fast_storage_impl=a.fast_storage
+async def _no_fast_storage(client,payload):return None
+a.fast_storage=_no_fast_storage
 
 class HTTPValidation(unittest.TestCase):
     def test_non_2xx_write_is_not_success(self):
