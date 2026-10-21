@@ -1011,7 +1011,62 @@ async def _wake(_body: dict) -> dict:
     return {"ok": True, "signed_in": SESSION is not None}
 
 
+async def _diag(body: dict) -> dict:
+    """Owner diagnostics (shared-secret protected): measure how fast THIS account forwards."""
+    client = CLIENT
+    if client is None:
+        return {"ok": False, "error": "not_signed_in"}
+    action = body.get("action")
+    if action == "me":
+        me = await client.get_me()
+        return {"ok": True, "id": me.id, "dc": client.session.dc_id, "premium": bool(getattr(me, "premium", False)),
+                "restricted": bool(getattr(me, "restricted", False)), "scam": bool(getattr(me, "scam", False))}
+    if action == "spambot":
+        bot = await client.get_entity("SpamBot")
+        sent = await client.send_message(bot, "/start")
+        for _ in range(10):
+            await asyncio.sleep(1.5)
+            msgs = await client.get_messages(bot, limit=3, min_id=sent.id)
+            if msgs:
+                return {"ok": True, "reply": msgs[0].message}
+        return {"ok": True, "reply": None}
+    if action == "forward":
+        src = await resolve_source(client, body["src"])
+        dest_spec = body["dest"]
+        dest = await client.get_input_entity("me") if dest_spec == "me" else await resolve_pool(client, int(dest_spec), int(body["bot_id"]))
+        ids = [int(x) for x in body["ids"]][:100]
+        req = build_forward_request(src, dest, ids, not body.get("drop_author", True))
+        t = time.monotonic(); err = None; copies = []
+        try:
+            copies = await _invoke_forward(client, req, dest)   # Telethon default retries for timing
+        except Exception as exc:
+            err = type(exc).__name__
+        first = time.monotonic() - t
+        after = int(body.get("after_id", 0))
+        if err:  # follow in storage until all land (max 70 s)
+            srcs = _real(await client.get_messages(src, ids=ids))
+            while time.monotonic() - t < 70:
+                await asyncio.sleep(1)
+                copies = await landed_copies(client, dest, after, srcs)
+                if len(copies) >= len(srcs):
+                    break
+        elapsed = time.monotonic() - t
+        made = [m.id for m in copies if m is not None]
+        if body.get("cleanup", True) and made:
+            try:
+                await client.delete_messages(dest, made)
+            except Exception:
+                pass
+        return {"ok": True, "n": len(ids), "landed": len(made), "first_answer_s": round(first, 2),
+                "elapsed_s": round(elapsed, 2), "error": err}
+    if action == "latest":
+        dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
+        return {"ok": True, "latest": await latest_message_id(client, dest)}
+    return {"ok": False, "error": "unknown_action"}
+
+
 ROUTES = {
+    "/diag": _diag,
     "/wake": _wake,
     "/login/start": lambda b: _login_start(b["phone"]),
     "/login/code": lambda b: _login_code(b["id"], b["code"]),
