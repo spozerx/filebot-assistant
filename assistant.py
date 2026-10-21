@@ -1169,6 +1169,18 @@ async def _diag(body: dict) -> dict:
             return {"ok": True, "n": len(ids), "landed": landed, "elapsed_s": round(time.monotonic() - t, 2), "error": err}
         finally:
             await client(DeleteChannelRequest(chan))
+    if action == "promote":
+        # Make a clone bot an admin of one of this account's own storage channels and confirm it.
+        from telethon.tl.functions.channels import GetParticipantRequest
+        chan = await client.get_entity(int(body["chat"]))
+        if not getattr(chan, "creator", False):
+            return {"ok": False, "error": "not_own_channel"}
+        bot = await client.get_entity(body["username"])
+        if not getattr(bot, "bot", False) or int(bot.id) != int(body["bot_id"]):
+            return {"ok": False, "error": "bot_identity_mismatch"}
+        await client(EditAdminRequest(channel=chan, user_id=bot, admin_rights=BOT_RIGHTS, rank="storage"))
+        part = await client(GetParticipantRequest(chan, bot))
+        return {"ok": True, "role": type(part.participant).__name__}
     if action == "latest":
         dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
         return {"ok": True, "latest": await latest_message_id(client, dest)}
