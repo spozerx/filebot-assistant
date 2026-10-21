@@ -9,6 +9,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 spec=importlib.util.spec_from_file_location('assistant_under_test',Path(__file__).parents[1]/'assistant.py')
 a=importlib.util.module_from_spec(spec);spec.loader.exec_module(a)
+# Test clients are plain namespaces: route the single forward request through their
+# forward_messages(dest, ids, source) fake, keeping the request (and its random_ids) visible.
+async def _test_invoke_forward(client,req,dest):
+    log=getattr(client,'requests',None)
+    if isinstance(log,list):log.append((list(req.id),list(req.random_id)))
+    return await client.forward_messages(dest,list(req.id),req.from_peer,drop_author=req.drop_author)
+a._invoke_forward=_test_invoke_forward
 
 class HTTPValidation(unittest.TestCase):
     def test_non_2xx_write_is_not_success(self):

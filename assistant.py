@@ -44,7 +44,7 @@ from telethon.errors import (
 )
 from telethon.sessions import StringSession
 from telethon.tl.functions.channels import EditAdminRequest
-from telethon.tl.functions.messages import ImportChatInviteRequest
+from telethon.tl.functions.messages import ForwardMessagesRequest, ImportChatInviteRequest
 from telethon.tl.types import ChatAdminRights, MessageEmpty
 
 logging.basicConfig(
@@ -401,20 +401,26 @@ async def publish_storage_checkpoint(body):
 
 
 # ---------------------------------------------------------------- confirmed forwarding
-# Telegram sometimes answers a large forward with WORKER_BUSY_TOO_LONG_RETRY (or a
-# timeout) although it carries the forward out a few seconds later. Telethon then gives
-# up with "ValueError: Request was unsuccessful". Treating that as "nothing happened"
-# left real copies in storage that were never published (Completed stayed at 0), and
-# every job retry copied the same files again. So an unanswered forward is never
-# guessed: the storage channel is read back and only copies that are really there,
-# matched to their source message and in order, are published. Whatever is still
-# missing is retried in smaller groups, which Telegram handles within its time limit.
-FORWARD_STEPS = (100, 20, 5, 1)
-FORWARD_ATTEMPTS_WITHOUT_PROGRESS = 4
-FORWARD_SETTLE_SECONDS = (3, 6)
+# How the official Telegram apps forward 100 messages, and how this engine does it too:
+#   * ONE messages.forwardMessages request for the whole chunk (up to 100 ids), carrying one
+#     random_id per message. Telegram de-duplicates by random_id, so re-sending that exact
+#     request can never create a second copy.
+#   * Telegram may answer WORKER_BUSY_TOO_LONG_RETRY / time out while it is still carrying the
+#     forward out server-side (slow, rate-limited accounts see this constantly). The apps simply
+#     wait and repeat the identical request; they never send a different, smaller request for
+#     "missing" messages, because those are usually still being processed.
+# So: an unanswered forward is never guessed and never split. The storage channel is read
+# back every few seconds; copies that really landed (matched to their source, in order) are
+# published at once so the user's progress moves, and the identical request is repeated only
+# while nothing new arrives. The earlier step-down (100 -> 20 -> 5 -> 1) sent NEW requests for
+# copies Telegram had not finished yet, which produced duplicate storage copies and minutes of
+# extra work; it is gone.
+FORWARD_POLL_SECONDS = 2        # read the storage channel this often while Telegram works
+FORWARD_RESEND_SECONDS = 12     # repeat the identical request after this long without new copies
+FORWARD_STALL_SECONDS = 150     # give up (job retried later) after this long without any new copy
 UNCONFIRMED_ERRORS = (
     ValueError,                      # Telethon: "Request was unsuccessful N time(s)"
-    tg_errors.ServerError,           # includes WorkerBusyTooLongRetryError
+    tg_errors.ServerError,           # WorkerBusyTooLongRetryError, RandomIdDuplicateError, ...
     tg_errors.RpcCallFailError,
     asyncio.TimeoutError,
     ConnectionError,
@@ -423,7 +429,7 @@ UNCONFIRMED_ERRORS = (
 
 
 class StorageNotConfirmed(RuntimeError):
-    """Telegram kept failing to confirm storage copies; the job is retried later."""
+    """Telegram stopped making progress on a storage forward; the job is retried later."""
 
 
 def _media_key(m):
@@ -470,9 +476,9 @@ async def landed_copies(client, dest, after_id: int, sources: list) -> list:
 
 
 @contextlib.contextmanager
-def few_internal_retries(client, retries=1):
-    # Telethon re-sends an unanswered request about 6 times (~40 s) before failing. Two tries
-    # are enough here because the outcome is verified by reading the storage channel.
+def few_internal_retries(client, retries=0):
+    # Telethon would re-send an unanswered request ~6 times (~40 s) before failing. Here each
+    # attempt is followed by a storage read-back instead, so Telethon itself tries only once.
     old = getattr(client, "_request_retries", None)
     if old is not None:
         client._request_retries = retries
@@ -483,42 +489,99 @@ def few_internal_retries(client, retries=1):
             client._request_retries = old
 
 
-async def forward_confirmed(client, dest, source, part: list, keep_tag: bool, after_id: int):
-    """
-    Forward `part` (source Message objects, ascending). Returns (copies, status):
-      "ok"          every message copied; copies align with part
-      "incomplete"  Telegram answered with gaps; copies is the aligned leading prefix
-      "unconfirmed" Telegram did not answer; copies is what verifiably landed (prefix)
-    """
-    ids = [m.id for m in part]
-    try:
-        with few_internal_retries(client):
-            result = await client.forward_messages(dest, ids, source, drop_author=not keep_tag)
-    except FloodWaitError:
-        raise
-    except UNCONFIRMED_ERRORS as exc:
-        log.warning("storage forward of %d unconfirmed (%s); checking storage", len(ids), type(exc).__name__)
-        found = []
-        for wait in FORWARD_SETTLE_SECONDS:
-            await asyncio.sleep(wait)
-            again = await landed_copies(client, dest, after_id, part)
-            if len(again) <= len(found) and found:
-                break
-            found = again
-            if len(found) == len(part):
-                break
-        log.info("storage check: %d of %d forwarded copies found", len(found), len(part))
-        return found, "unconfirmed"
-    copied = result if isinstance(result, list) else [result]
-    if len(copied) == len(ids) and all(m is not None and not isinstance(m, MessageEmpty) for m in copied):
+def build_forward_request(source, dest, ids, keep_tag):
+    """One request, fixed random_ids: every re-send is the same request to Telegram."""
+    return ForwardMessagesRequest(from_peer=source, id=list(ids), to_peer=dest, drop_author=not keep_tag)
+
+
+async def _invoke_forward(client, req, dest):
+    with few_internal_retries(client):
+        result = await client(req)
+    copies = client._get_response_message(req, result, dest)
+    return copies if isinstance(copies, list) else [copies]
+
+
+def _monotonic():
+    return time.monotonic()
+
+
+def _forward_outcome(copied, part, landed):
+    if len(copied) == len(part) and all(m is not None and not isinstance(m, MessageEmpty) for m in copied):
         return copied, "ok"
     prefix = []
-    if len(copied) == len(ids):
+    if len(copied) == len(part):
         for message in copied:
             if message is None or isinstance(message, MessageEmpty):
                 break
             prefix.append(message)
-    return prefix, "incomplete"
+    return (prefix if len(prefix) >= len(landed) else landed), "incomplete"
+
+
+async def forward_chunk(client, dest, source, part: list, keep_tag: bool, after_id: int, progress=None):
+    """
+    Forward `part` (source Message objects, ascending, at most 100) with ONE request.
+    While Telegram works, the storage channel is followed and `progress(copies)` is awaited
+    for every newly confirmed prefix. Returns (copies, status):
+      "ok"          every message copied; copies align with part
+      "incomplete"  Telegram answered with gaps; copies is the aligned leading prefix
+    Raises StorageNotConfirmed when Telegram makes no progress for FORWARD_STALL_SECONDS.
+    """
+    req = build_forward_request(source, dest, [m.id for m in part], keep_tag)
+    landed: list = []
+    last_new = sent_at = _monotonic()
+    attempts, task = 0, None
+    try:
+        while True:
+            if task is None:
+                attempts += 1
+                sent_at = _monotonic()
+                task = asyncio.ensure_future(_invoke_forward(client, req, dest))
+            # Let Telegram answer; meanwhile keep the user's progress moving from storage.
+            await asyncio.wait({task}, timeout=FORWARD_POLL_SECONDS)
+            if task.done():
+                finished, task = task, None
+                try:
+                    copied = finished.result()
+                except FloodWaitError:
+                    raise
+                except UNCONFIRMED_ERRORS as exc:
+                    if attempts == 1:
+                        log.info("storage forward of %d still running at Telegram (%s); following it in storage",
+                                 len(part), type(exc).__name__)
+                    await asyncio.sleep(FORWARD_POLL_SECONDS)
+                else:
+                    return _forward_outcome(copied, part, landed)
+            found = await landed_copies(client, dest, after_id, part)
+            if len(found) > len(landed):
+                landed, last_new = found, _monotonic()
+                if progress is not None:
+                    await progress(landed)
+                if len(landed) == len(part):
+                    log.info("storage forward of %d confirmed in storage after %d request(s)", len(part), attempts)
+                    return landed, "ok"
+            if _monotonic() - last_new >= FORWARD_STALL_SECONDS:
+                log.warning("storage forward stalled: %d of %d copies after %d request(s)", len(landed), len(part), attempts)
+                raise StorageNotConfirmed("Telegram did not confirm the storage copy")
+            if task is None and _monotonic() - max(sent_at, last_new) < FORWARD_RESEND_SECONDS:
+                # No answer yet and copies may still be arriving: keep watching before repeating.
+                while _monotonic() - max(sent_at, last_new) < FORWARD_RESEND_SECONDS:
+                    await asyncio.sleep(FORWARD_POLL_SECONDS)
+                    found = await landed_copies(client, dest, after_id, part)
+                    if len(found) > len(landed):
+                        landed, last_new = found, _monotonic()
+                        if progress is not None:
+                            await progress(landed)
+                        if len(landed) == len(part):
+                            log.info("storage forward of %d confirmed in storage after %d request(s)", len(part), attempts)
+                            return landed, "ok"
+                    if _monotonic() - last_new >= FORWARD_STALL_SECONDS:
+                        log.warning("storage forward stalled: %d of %d copies after %d request(s)", len(landed), len(part), attempts)
+                        raise StorageNotConfirmed("Telegram did not confirm the storage copy")
+            # Loop: task None -> repeat the identical request (same random_ids: no duplicates).
+    finally:
+        if task is not None and not task.done():
+            task.cancel()
+
 
 async def fetch_range(client: TelegramClient, payload: dict) -> None:
     if payload.get("storage_version") != 1:
@@ -566,30 +629,31 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
         # Keep one maximal operation even when some messages carry keyboards: forward the
         # whole chunk with attribution when needed to preserve those buttons.
         keep_tag = any(getattr(m, 'reply_markup', None) is not None for m in usable)
-        todo, step, stalls = list(usable), 0, 0
         if after_id is None:
             after_id = await latest_message_id(client, dest)
-        while todo:
-            part = todo[:FORWARD_STEPS[step]]
-            # Ordered MTProto batches keep normal storage throughput high; no artificial pause.
-            copied, status = await forward_confirmed(client, dest, source, part, keep_tag, after_id)
-            if any(not isinstance(m.id, int) or m.id <= 0 or (i and m.id <= copied[i-1].id) for i, m in enumerate(copied)):
+        done_in_chunk = 0
+
+        async def confirm(copies):
+            # Publish the newly confirmed prefix at once so Completed/Remaining move live.
+            nonlocal done_in_chunk
+            if len(copies) <= done_in_chunk:
+                return
+            if any(not isinstance(m.id, int) or m.id <= 0 or (i and m.id <= copies[i-1].id) for i, m in enumerate(copies)):
                 raise PermanentJobError("Unexpected destination message ordering")
-            if copied:
-                done_all = len(copied) == len(todo)
-                await publish(end + 1 if done_all else part[len(copied)-1].id + 1, [m.id for m in part[:len(copied)]], copied)
-                after_id = max(after_id, copied[-1].id)
-                todo = todo[len(copied):]
-                stalls = 0
-            if status == "incomplete":
-                # Never silently count a partial forward as complete: only the confirmed
-                # leading prefix was published; stop for an explicit operator-visible failure.
-                raise PermanentJobError("Telegram returned an incomplete storage batch; remaining files were not marked stored")
-            if status == "unconfirmed" and todo:
-                stalls += 0 if copied else 1
-                if stalls >= FORWARD_ATTEMPTS_WITHOUT_PROGRESS:
-                    raise StorageNotConfirmed("Telegram did not confirm the storage copy")
-                step = min(step + 1, len(FORWARD_STEPS) - 1)
+            n = len(copies)
+            await publish(end + 1 if n == len(usable) else usable[n-1].id + 1,
+                          [m.id for m in usable[done_in_chunk:n]], copies[done_in_chunk:n])
+            done_in_chunk = n
+
+        # One forward request for the whole chunk (Telegram's maximum is 100 messages).
+        copied, status = await forward_chunk(client, dest, source, usable, keep_tag, after_id, confirm)
+        await confirm(copied)
+        if copied:
+            after_id = max(after_id, copied[-1].id)
+        if status == "incomplete":
+            # Never silently count a partial forward as complete: only the confirmed
+            # leading prefix was published; stop for an explicit operator-visible failure.
+            raise PermanentJobError("Telegram returned an incomplete storage batch; remaining files were not marked stored")
     await publish(last+1, [], [], done=True)
     log.info("checkpointed storage complete: %d confirmed messages", published)
 
@@ -976,7 +1040,7 @@ class Api(BaseHTTPRequestHandler):
         if self.path not in ("/", "/health"):
             return self._send(404, {"ok": False})
         self._send(200, {"ok": True, "signed_in": bool(SESSION and CLIENT and CLIENT.is_connected()),
-                         "protocol": 2, "storage_protocol": 2, "version": "storage-confirm-2026-10-21"})
+                         "protocol": 2, "storage_protocol": 2, "version": "no-dup-2026-10-21"})
 
     def do_POST(self):
         if not hmac.compare_digest(self.headers.get("authorization", ""), f"Bearer {SHARED_SECRET}"):

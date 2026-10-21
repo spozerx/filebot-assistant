@@ -2,6 +2,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 from test_hardening import a
+import asyncio as _asyncio
+asyncio_real_sleep = _asyncio.sleep
 
 BUSY = a.tg_errors.WorkerBusyTooLongRetryError(request=None)
 
@@ -18,6 +20,10 @@ class ConfirmedForward(unittest.IsolatedAsyncioTestCase):
         self.published = []; self.cursor = 1; self.total = 0
         self.calls = []            # sizes of forward requests
         self.real = set(range(1, 102, 2))  # 51 real messages, the rest are deleted ids (gaps)
+        self.clock = 0.0
+
+    async def fake_sleep(self, seconds):
+        self.clock += seconds
 
     def src(self, i):
         return SimpleNamespace(id=i, action=None, noforwards=False, reply_markup=None, message=f'cap {i}',
@@ -43,7 +49,7 @@ class ConfirmedForward(unittest.IsolatedAsyncioTestCase):
             self.calls.append(len(ids))
             return behaviour(list(ids))
         return SimpleNamespace(get_messages=AsyncMock(side_effect=get), forward_messages=AsyncMock(side_effect=forward),
-                               _request_retries=5)
+                               _request_retries=5, requests=[])
 
     async def publish(self, method, path, body):
         self.published.append(body)
@@ -55,7 +61,8 @@ class ConfirmedForward(unittest.IsolatedAsyncioTestCase):
         with patch.object(a, 'resolve_source', AsyncMock(return_value=SimpleNamespace(noforwards=False))), \
              patch.object(a, 'resolve_pool', AsyncMock(return_value='pool')), \
              patch.object(a, 'worker_request', AsyncMock(side_effect=self.publish)), \
-             patch.object(a.asyncio, 'sleep', AsyncMock()):
+             patch.object(a.asyncio, 'sleep', AsyncMock(side_effect=self.fake_sleep)), \
+             patch.object(a, '_monotonic', lambda: self.clock):
             await a.fetch_range(client, payload or self.payload)
 
     def stored_sources(self):
@@ -79,23 +86,43 @@ class ConfirmedForward(unittest.IsolatedAsyncioTestCase):
         await self.run_job(self.client(gave_up))
         self.assertEqual(self.total, 51); self.assertEqual(len(self.storage), 51)
 
-    async def test_busy_and_nothing_landed_retries_in_smaller_groups(self):
-        def big_fails(ids):
-            if len(ids) > 20: raise BUSY
-            return self.land(ids)
-        await self.run_job(self.client(big_fails))
-        self.assertEqual(self.calls[:4], [50, 20, 20, 10])
-        self.assertEqual(self.stored_sources(), sorted(self.real)); self.assertEqual(len(self.storage), 51)
+    async def test_busy_then_slow_landing_never_sends_a_different_request(self):
+        # Telegram is still working (busy), copies trickle in over time: wait, never split.
+        pending = []
+        def busy(ids):
+            # Telegram starts the forward once per random_id set; repeats change nothing.
+            have = {m.src for m in self.storage} | set(pending)
+            pending.extend(i for i in ids if i not in have)
+            raise BUSY
+        client = self.client(busy)
+        orig = client.get_messages.side_effect
+        async def trickle(chat, ids=None, limit=None, min_id=None):
+            if ids is None and pending:
+                self.land(pending[:7]); del pending[:7]   # ~7 copies land per storage check
+            return await orig(chat, ids=ids, limit=limit, min_id=min_id)
+        client.get_messages.side_effect = trickle
+        await self.run_job(client)
+        self.assertTrue(all(n == 50 for n in self.calls[:-1]), self.calls)   # only the full chunk, re-sent
+        first_chunk = [r for r in client.requests if len(r[0]) == 50]
+        self.assertTrue(all(r == first_chunk[0] for r in first_chunk), 'identical ids AND random_ids on every re-send')
+        self.assertEqual(self.stored_sources(), sorted(self.real)); self.assertEqual(len(self.storage), 51, 'no duplicates')
+        self.assertGreater(len([b for b in self.published if b['msg_ids']]), 3, 'progress published as copies land')
         self.assertTrue(self.published[-1]['done'])
 
-    async def test_partly_landed_prefix_is_kept_and_only_the_rest_is_sent(self):
+    async def test_partly_landed_prefix_is_published_and_identical_request_finishes_it(self):
         state = {'first': True}
         def half(ids):
             if state['first']:
                 state['first'] = False; self.land(ids[:10]); raise BUSY
-            return self.land(ids)
-        await self.run_job(self.client(half))
-        self.assertEqual(self.calls[:2], [50, 20])
+            # Telegram dedups the repeated random_ids: it lands only what is still missing.
+            have = {m.src for m in self.storage}
+            self.land([i for i in ids if i not in have])
+            by = {m.src: m for m in self.storage}
+            return [by[i] for i in ids]
+        client = self.client(half)
+        await self.run_job(client)
+        self.assertEqual(self.calls[:2], [50, 50])
+        self.assertEqual(client.requests[0], client.requests[1])
         self.assertEqual(self.stored_sources(), sorted(self.real)); self.assertEqual(len(self.storage), 51)
         self.assertEqual(len(self.published[0]['msg_ids']), 10)
 
@@ -104,7 +131,10 @@ class ConfirmedForward(unittest.IsolatedAsyncioTestCase):
         def half(ids):
             if state['first']:
                 state['first'] = False; self.land(ids[:3]); raise BUSY
-            return self.land(ids)
+            have = {m.src for m in self.storage}
+            self.land([i for i in ids if i not in have])
+            by = {m.src: m for m in self.storage}
+            return [by[i] for i in ids]
         await self.run_job(self.client(half))
         first = self.published[0]
         self.assertEqual(first['source_ids'], [1, 3, 5]); self.assertEqual(first['next_id'], 6)
@@ -113,8 +143,41 @@ class ConfirmedForward(unittest.IsolatedAsyncioTestCase):
         def never(ids): raise BUSY
         client = self.client(never)
         with self.assertRaises(a.StorageNotConfirmed): await self.run_job(client)
-        self.assertEqual(self.calls, [50, 20, 5, 1]); self.assertEqual(self.published, [])
+        self.assertTrue(all(n == 50 for n in self.calls)); self.assertEqual(len({tuple(map(tuple, r)) for r in client.requests}), 1)
+        self.assertGreaterEqual(self.clock, a.FORWARD_STALL_SECONDS); self.assertEqual(self.published, [])
         self.assertEqual(client._request_retries, 5, 'client retry setting restored')
+
+    async def test_each_chunk_is_one_request_with_its_own_random_ids(self):
+        client = self.client(lambda ids: self.land(ids))
+        await self.run_job(client)
+        self.assertEqual(self.calls, [50, 1])
+        ids = [x for r in client.requests for x in r[1]]
+        self.assertEqual(len(ids), len(set(ids)), 'random_ids are unique per message and per chunk')
+
+    async def test_progress_moves_while_telegram_still_holds_the_request(self):
+        pending, answered = [], []
+        client = self.client(lambda ids: None)
+        async def held(dest, ids, source, **kw):
+            self.calls.append(len(ids)); pending.extend(ids)
+            while pending:                      # Telegram answers only when everything landed
+                await a.asyncio.sleep(0)        # (patched sleep) give the poller a turn
+                await asyncio_real_sleep(0.001)
+            answered.append(len(self.published))
+            by = {m.src: m for m in self.storage}
+            return [by[i] for i in ids]
+        client.forward_messages = held
+        orig = client.get_messages.side_effect
+        async def trickle(chat, ids=None, limit=None, min_id=None):
+            if ids is None and pending:
+                self.land(pending[:10]); del pending[:10]
+            return await orig(chat, ids=ids, limit=limit, min_id=min_id)
+        client.get_messages.side_effect = trickle
+        with patch.object(a, 'FORWARD_POLL_SECONDS', 0.001):
+            await self.run_job(client)
+        self.assertEqual(answered, [], 'all copies confirmed from storage before Telegram even answered')
+        self.assertGreater(len([b for b in self.published if b['msg_ids']]), 3, 'progress published in steps as copies land')
+        self.assertEqual(self.calls, [50, 1]); self.assertEqual(len(self.storage), 51)
+        self.assertEqual(self.stored_sources(), sorted(self.real)); self.assertTrue(self.published[-1]['done'])
 
     async def test_other_posts_in_storage_are_not_adopted(self):
         def busy(ids):
