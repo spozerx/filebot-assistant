@@ -1059,6 +1059,35 @@ async def _diag(body: dict) -> dict:
                 pass
         return {"ok": True, "n": len(ids), "landed": len(made), "first_answer_s": round(first, 2),
                 "elapsed_s": round(elapsed, 2), "error": err}
+    if action == "chaninfo":
+        from telethon.tl.functions.channels import GetFullChannelRequest
+        ent = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
+        full = await client(GetFullChannelRequest(ent))
+        ch = full.chats[0] if full.chats else None
+        fc = full.full_chat
+        photo_dc = getattr(getattr(ch, "photo", None), "dc_id", None)
+        return {"ok": True, "title": getattr(ch, "title", None), "creator": bool(getattr(ch, "creator", False)),
+                "admin_rights": str(getattr(ch, "admin_rights", None))[:300], "megagroup": bool(getattr(ch, "megagroup", False)),
+                "signatures": bool(getattr(ch, "signatures", False)), "participants": getattr(fc, "participants_count", None),
+                "admins": getattr(fc, "admins_count", None), "linked_chat": getattr(fc, "linked_chat_id", None),
+                "slowmode": getattr(fc, "slowmode_seconds", None), "photo_dc": photo_dc,
+                "pts": getattr(fc, "pts", None), "date": str(getattr(ch, "date", None))}
+    if action == "newchan":
+        from telethon.tl.functions.channels import CreateChannelRequest, DeleteChannelRequest
+        made = await client(CreateChannelRequest(title="speedtest", about="temp", broadcast=True))
+        chan = made.chats[0]
+        try:
+            src = await resolve_source(client, body["src"])
+            ids = [int(x) for x in body["ids"]][:100]
+            req = build_forward_request(src, chan, ids, False)
+            t = time.monotonic(); err = None; landed = 0
+            try:
+                landed = len([m for m in await _invoke_forward(client, req, chan) if m is not None])
+            except Exception as exc:
+                err = type(exc).__name__
+            return {"ok": True, "n": len(ids), "landed": landed, "elapsed_s": round(time.monotonic() - t, 2), "error": err}
+        finally:
+            await client(DeleteChannelRequest(chan))
     if action == "latest":
         dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
         return {"ok": True, "latest": await latest_message_id(client, dest)}
