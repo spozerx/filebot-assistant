@@ -1197,6 +1197,19 @@ async def _diag(body: dict) -> dict:
         await client(EditAdminRequest(channel=chan, user_id=bot, admin_rights=BOT_RIGHTS, rank="storage"))
         part = await client(GetParticipantRequest(chan, bot))
         return {"ok": True, "role": type(part.participant).__name__}
+    if action == "pool_list":
+        # Read-only: what is in one of this account's storage channels between two ids (for duplicate/missing audits).
+        dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
+        lo, hi = int(body["min_id"]), int(body["max_id"])
+        if hi - lo > 400:
+            return {"ok": False, "error": "range_too_large"}
+        msgs = _real(await client.get_messages(dest, ids=list(range(lo, hi + 1))))
+        out = []
+        for m in msgs:
+            f = getattr(m, "file", None)
+            out.append([m.id, (getattr(f, "name", None) or "")[:60], getattr(f, "size", None),
+                        (getattr(m, "message", None) or "")[:50], int(m.date.timestamp()) if m.date else None])
+        return {"ok": True, "messages": out}
     if action == "latest":
         dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
         return {"ok": True, "latest": await latest_message_id(client, dest)}
