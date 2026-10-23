@@ -274,9 +274,30 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
         admin_rights=BOT_RIGHTS,
         rank="storage",
     ))
-    log.info("clone promotion complete")
+    # Rotation storage channels (best effort): the Worker skips any channel this bot cannot post in.
+    extra_ok = []
+    for extra in payload.get("extra_pools") or []:
+        if int(extra) == int(pool):
+            continue
+        try:
+            await asyncio.sleep(3)
+            try:
+                chan_x = await client.get_entity(int(extra))
+            except (ValueError, TypeError):
+                await client.get_dialogs(limit=None, archived=True)   # fills Telethon's entity cache once
+                chan_x = await client.get_entity(int(extra))
+            if not getattr(chan_x, "creator", False):
+                continue
+            await client(EditAdminRequest(channel=chan_x, user_id=bot, admin_rights=BOT_RIGHTS, rank="storage"))
+            extra_ok.append(int(extra))
+        except FloodWaitError as exc:
+            log.warning("rotation channel promotion paused (flood wait %ss)", exc.seconds)
+            break
+        except Exception as exc:  # noqa: BLE001 - never fail the clone over an extra channel
+            log.warning("rotation channel %s promotion failed: %s", extra, type(exc).__name__)
+    log.info("clone promotion complete (+%d rotation channels)", len(extra_ok))
     _last_promote = time.time()
-    return {"pool": int(pool)}
+    return {"pool": int(pool), "extra_pools": extra_ok}
 
 
 async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
@@ -1197,6 +1218,35 @@ async def _diag(body: dict) -> dict:
         await client(EditAdminRequest(channel=chan, user_id=bot, admin_rights=BOT_RIGHTS, rank="storage"))
         part = await client(GetParticipantRequest(chan, bot))
         return {"ok": True, "role": type(part.participant).__name__}
+    if action == "make_pool":
+        # Create one more own storage channel for rotation, keep it out of the chat list (archived),
+        # and make the given bots its admins. Returns the Bot API chat id and per-bot results.
+        from telethon.tl.functions.folders import EditPeerFoldersRequest
+        from telethon.tl.types import InputFolderPeer
+        made = await client(CreateChannelRequest(title=str(body.get("title") or "Filebot storage"), broadcast=True,
+                                                 about="Storage for file links. Do not delete or leave."))
+        chan = made.chats[0]
+        try:
+            await client(EditPeerFoldersRequest([InputFolderPeer(peer=chan, folder_id=1)]))
+            archived = True
+        except Exception:  # noqa: BLE001 - archiving is cosmetic
+            archived = False
+        results = {}
+        for b in body.get("bots") or []:
+            try:
+                bot = await client.get_entity(b["username"])
+                if not getattr(bot, "bot", False) or int(bot.id) != int(b["bot_id"]):
+                    results[str(b["bot_id"])] = "identity_mismatch"
+                    continue
+                await client(EditAdminRequest(channel=chan, user_id=bot, admin_rights=BOT_RIGHTS, rank="storage"))
+                results[str(b["bot_id"])] = "ok"
+            except FloodWaitError as exc:
+                results[str(b["bot_id"])] = f"flood_{exc.seconds}"
+                break
+            except Exception as exc:  # noqa: BLE001
+                results[str(b["bot_id"])] = type(exc).__name__
+            await asyncio.sleep(float(body.get("gap") or 2))
+        return {"ok": True, "chat_id": channel_chat_id(chan), "archived": archived, "results": results}
     if action == "pool_list":
         # Read-only: what is in one of this account's storage channels between two ids (for duplicate/missing audits).
         dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
