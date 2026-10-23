@@ -1221,13 +1221,14 @@ async def _diag(body: dict) -> dict:
     if action == "make_pool":
         # Create one more own storage channel for rotation, keep it out of the chat list (archived),
         # and make the given bots its admins. Returns the Bot API chat id and per-bot results.
+        from telethon.tl.functions.channels import CreateChannelRequest as _CreateChannel
         from telethon.tl.functions.folders import EditPeerFoldersRequest
         from telethon.tl.types import InputFolderPeer
-        made = await client(CreateChannelRequest(title=str(body.get("title") or "Filebot storage"), broadcast=True,
+        made = await client(_CreateChannel(title=str(body.get("title") or "Filebot storage"), broadcast=True,
                                                  about="Storage for file links. Do not delete or leave."))
         chan = made.chats[0]
         try:
-            await client(EditPeerFoldersRequest([InputFolderPeer(peer=chan, folder_id=1)]))
+            await client(EditPeerFoldersRequest([InputFolderPeer(peer=await client.get_input_entity(chan), folder_id=1)]))
             archived = True
         except Exception:  # noqa: BLE001 - archiving is cosmetic
             archived = False
