@@ -1210,6 +1210,15 @@ async def _diag(body: dict) -> dict:
             out.append([m.id, (getattr(f, "name", None) or "")[:60], getattr(f, "size", None),
                         (getattr(m, "message", None) or "")[:50], int(m.date.timestamp()) if m.date else None])
         return {"ok": True, "messages": out}
+    if action == "pool_delete":
+        # Remove orphan copies (never referenced by any stored file) from one of this account's own storage channels.
+        dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
+        ent = await client.get_entity(dest)
+        if not getattr(ent, "creator", False):
+            return {"ok": False, "error": "not_own_channel"}
+        ids = sorted({int(x) for x in body["ids"]})[:100]
+        res = await client.delete_messages(dest, ids)
+        return {"ok": True, "requested": len(ids), "deleted": sum(getattr(r, "pts_count", 0) for r in (res or []))}
     if action == "latest":
         dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
         return {"ok": True, "latest": await latest_message_id(client, dest)}
