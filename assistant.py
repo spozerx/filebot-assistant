@@ -1176,6 +1176,22 @@ async def _diag(body: dict) -> dict:
                                   for i, m in zip(ids, copies)]   # source id -> new id, in order
         return {"ok": True, "n": len(ids), "landed": len(made), "first_answer_s": round(first, 2),
                 "elapsed_s": round(elapsed, 2), "error": err, "pairs": pairs}
+    if action == "uncopyable":
+        # Which posts in a source range Telegram will refuse to copy (protected, unsupported media, service
+        # messages). The bot leaves exactly these out of its 100-per-call copies. Deleted posts are not listed.
+        src = await resolve_source(client, body["chat"])
+        lo, hi = int(body["from"]), int(body["to"])
+        if lo < 1 or hi < lo or hi - lo >= 300:
+            return {"ok": False, "error": "bad_range"}
+        bad = []
+        for start in range(lo, hi + 1, 100):
+            ids = list(range(start, min(hi, start + 99) + 1))
+            for m in await client.get_messages(src, ids=ids):
+                if m is None or isinstance(m, MessageEmpty):
+                    continue
+                if getattr(m, "action", None) or not forwardable(m):
+                    bad.append(int(m.id))
+        return {"ok": True, "from": lo, "to": hi, "bad": sorted(bad)}
     if action == "chaninfo":
         from telethon.tl.functions.channels import GetFullChannelRequest
         ent = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
