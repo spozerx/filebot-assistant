@@ -274,7 +274,29 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
         admin_rights=BOT_RIGHTS,
         rank="storage",
     ))
-    log.info("clone promotion complete")
+    # Overflow channels (best effort): used only while Telegram holds the clone in its own channel; the Worker
+    # skips any channel the clone cannot post in.
+    extra_ok = []
+    for extra in payload.get("extra_pools") or []:
+        if int(extra) == int(pool):
+            continue
+        try:
+            await asyncio.sleep(3)
+            try:
+                chan_x = await client.get_entity(int(extra))
+            except (ValueError, TypeError):
+                await client.get_dialogs(limit=None, archived=True)   # fills Telethon's entity cache once
+                chan_x = await client.get_entity(int(extra))
+            if not (getattr(chan_x, "creator", False) or getattr(getattr(chan_x, "admin_rights", None), "add_admins", False)):
+                continue
+            await client(EditAdminRequest(channel=chan_x, user_id=bot, admin_rights=BOT_RIGHTS, rank="storage"))
+            extra_ok.append(int(extra))
+        except FloodWaitError as exc:
+            log.warning("overflow channel promotion paused (flood wait %ss)", exc.seconds)
+            break
+        except Exception as exc:  # noqa: BLE001 - never fail the clone over an overflow channel
+            log.warning("overflow channel %s promotion failed: %s", extra, type(exc).__name__)
+    log.info("clone promotion complete (+%d overflow channels)", len(extra_ok))
     _last_promote = time.time()
     return {"pool": int(pool)}
 
