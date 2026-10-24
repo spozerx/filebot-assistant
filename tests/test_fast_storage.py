@@ -77,7 +77,7 @@ class FastStorage(unittest.IsolatedAsyncioTestCase):
         with patch.object(a, 'worker_request', AsyncMock(side_effect=a.WorkerAPIError(503))):
             self.assertIsNone(await a._fast_storage_impl(client, {'bot_id': 1}))
 
-    async def test_fetch_range_publishes_into_the_own_channel(self):
+    async def test_fetch_range_stays_in_the_batch_channel(self):
         published = []
         async def publish(method, path, body):
             published.append(body); return {'ok': True, 'next_id': body['next_id'], 'total': len(body['msg_ids'])}
@@ -85,12 +85,12 @@ class FastStorage(unittest.IsolatedAsyncioTestCase):
         client = SimpleNamespace(get_messages=AsyncMock(side_effect=lambda c, ids=None, limit=None, min_id=None: msgs(ids) if ids else []),
                                  forward_messages=AsyncMock(side_effect=lambda d, ids, s, **k: msgs([1000 + i for i in ids])))
         with patch.object(a, 'resolve_source', AsyncMock(return_value=SimpleNamespace(noforwards=False))), \
-             patch.object(a, 'resolve_pool', AsyncMock(side_effect=AssertionError('old pool must not be used'))), \
-             patch.object(a, 'fast_storage', AsyncMock(return_value=('own', -1000000000300))), \
+             patch.object(a, 'resolve_pool', AsyncMock(return_value='pool')), \
+             patch.object(a, 'fast_storage', AsyncMock(side_effect=AssertionError('never switch to another channel'))), \
              patch.object(a, 'worker_request', AsyncMock(side_effect=publish)):
             await a.fetch_range(client, {'storage_version': 1, 'bot_id': 1, 'code': 'c', 'pool': -100, 'chat': '@s', 'from': 1, 'to': 100})
         self.assertEqual(client.forward_messages.await_count, 1, '100 messages, one request')
-        self.assertTrue(all(b['chat_id'] == -1000000000300 for b in published)); self.assertTrue(published[-1]['done'])
+        self.assertTrue(all(b['chat_id'] == -100 for b in published)); self.assertTrue(published[-1]['done'])
         self.assertEqual(len(published[0]['msg_ids']), 100)
 
 

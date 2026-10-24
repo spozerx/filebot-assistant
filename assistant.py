@@ -703,12 +703,8 @@ async def fetch_range(client: TelegramClient, payload: dict) -> None:
     source = await resolve_source(client, payload["chat"])
     if getattr(source, "noforwards", False):
         raise PermanentJobError("Telegram protects this source from forwarding")
-    # Pinned destination for the entire batch: the account's own channel (fast), else the pool.
-    fast = await fast_storage(client, payload)
-    if fast is not None:
-        dest, pool = fast
-    else:
-        dest = await resolve_pool(client, pool, bot_id)
+    # One storage channel per clone: the account continues the batch in the batch's own channel (never another one).
+    dest = await resolve_pool(client, pool, bot_id)
     published = int(payload.get("published_count", 0))
     after_id = None  # newest storage message before our next forward (for verification)
 
