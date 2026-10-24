@@ -1265,7 +1265,8 @@ async def _diag(body: dict) -> dict:
         # Remove orphan copies (never referenced by any stored file) from one of this account's own storage channels.
         dest = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
         ent = await client.get_entity(dest)
-        if not getattr(ent, "creator", False):
+        rights = getattr(ent, "admin_rights", None)
+        if not (getattr(ent, "creator", False) or getattr(rights, "delete_messages", False)):
             return {"ok": False, "error": "not_own_channel"}
         ids = sorted({int(x) for x in body["ids"]})[:100]
         res = await client.delete_messages(dest, ids)
