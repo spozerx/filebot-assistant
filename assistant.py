@@ -274,30 +274,9 @@ async def promote_clone(client: TelegramClient, payload: dict) -> None:
         admin_rights=BOT_RIGHTS,
         rank="storage",
     ))
-    # Rotation storage channels (best effort): the Worker skips any channel this bot cannot post in.
-    extra_ok = []
-    for extra in payload.get("extra_pools") or []:
-        if int(extra) == int(pool):
-            continue
-        try:
-            await asyncio.sleep(3)
-            try:
-                chan_x = await client.get_entity(int(extra))
-            except (ValueError, TypeError):
-                await client.get_dialogs(limit=None, archived=True)   # fills Telethon's entity cache once
-                chan_x = await client.get_entity(int(extra))
-            if not getattr(chan_x, "creator", False):
-                continue
-            await client(EditAdminRequest(channel=chan_x, user_id=bot, admin_rights=BOT_RIGHTS, rank="storage"))
-            extra_ok.append(int(extra))
-        except FloodWaitError as exc:
-            log.warning("rotation channel promotion paused (flood wait %ss)", exc.seconds)
-            break
-        except Exception as exc:  # noqa: BLE001 - never fail the clone over an extra channel
-            log.warning("rotation channel %s promotion failed: %s", extra, type(exc).__name__)
-    log.info("clone promotion complete (+%d rotation channels)", len(extra_ok))
+    log.info("clone promotion complete")
     _last_promote = time.time()
-    return {"pool": int(pool), "extra_pools": extra_ok}
+    return {"pool": int(pool)}
 
 
 async def resolve_pool(client: TelegramClient, pool: int, bot_id: int):
@@ -1171,8 +1150,10 @@ async def _diag(body: dict) -> dict:
                 await client.delete_messages(dest, made)
             except Exception:
                 pass
+        pairs = None if err else [[i, (m.id if m is not None and not isinstance(m, MessageEmpty) else None)]
+                                  for i, m in zip(ids, copies)]   # source id -> new id, in order
         return {"ok": True, "n": len(ids), "landed": len(made), "first_answer_s": round(first, 2),
-                "elapsed_s": round(elapsed, 2), "error": err}
+                "elapsed_s": round(elapsed, 2), "error": err, "pairs": pairs}
     if action == "chaninfo":
         from telethon.tl.functions.channels import GetFullChannelRequest
         ent = await resolve_pool(client, int(body["dest"]), int(body["bot_id"]))
@@ -1206,7 +1187,7 @@ async def _diag(body: dict) -> dict:
         # Make a clone bot an admin of one of this account's own storage channels and confirm it.
         from telethon.tl.functions.channels import GetParticipantRequest
         chan = await client.get_entity(int(body["chat"]))
-        if not getattr(chan, "creator", False):
+        if not (getattr(chan, "creator", False) or getattr(getattr(chan, "admin_rights", None), "add_admins", False)):
             return {"ok": False, "error": "not_own_channel"}
         bot = await client.get_entity(body["username"])
         if not getattr(bot, "bot", False) or int(bot.id) != int(body["bot_id"]):
